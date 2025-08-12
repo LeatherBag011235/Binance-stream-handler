@@ -1,1 +1,2 @@
-/target
+echo "target/" >> .gitignore
+echo "*.rs.bk" >> .gitignore
