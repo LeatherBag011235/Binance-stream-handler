@@ -15,4 +15,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
     //get_depth_snapshot("BTCUSDT", 1000).await;
-}
+    }
