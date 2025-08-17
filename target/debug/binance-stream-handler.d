@@ -1,1 +1,0 @@
-/home/maxim-shibanov/Projects_Rs/binance-stream-handler/target/debug/binance-stream-handler: /home/maxim-shibanov/Projects_Rs/binance-stream-handler/src/lib.rs /home/maxim-shibanov/Projects_Rs/binance-stream-handler/src/main.rs
