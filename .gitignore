@@ -1,2 +1,2 @@
-echo "target/" >> .gitignore
-echo "*.rs.bk" >> .gitignore
+target/
+*.rs.bk

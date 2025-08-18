@@ -4,6 +4,8 @@ use tokio_tungstenite::{connect_async};
 use tokio_tungstenite::tungstenite::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use futures_util::future::ready;
+
 
 
 #[derive(Debug, Deserialize)]
@@ -57,7 +59,7 @@ pub async fn streaming(
     Ok(ReceiverStream::new(rx))
 }
 
-pub fn create_ws_url(currency_pairs: Vec<&str>,) -> String {
+pub fn create_ws_url(currency_pairs: &Vec<&str>,) -> String {
     let stream_spec = "@depth@100ms";
     let base_url = "wss://fstream.binance.com/stream?streams=";
 
@@ -67,7 +69,6 @@ pub fn create_ws_url(currency_pairs: Vec<&str>,) -> String {
         if i > 0 {
             url.push_str("/")
         }
-        println!("{}", i);
         url.push_str(&insert_str);
     }
 
@@ -93,7 +94,7 @@ pub struct ResyncNeeded {
 }
 
 #[derive(Debug, Deserialize)]
-struct DepthSnapshot {
+pub struct DepthSnapshot {
     lastUpdateId: u64,
     E: u64, // event time (ms)
     T: u64, // transaction time (ms)
@@ -122,10 +123,10 @@ impl OrderBook {
     }
 
     pub async fn get_depth_snapshot(
-        symbol: &str,
+        &self,
         limit: u16,
     ) -> Result<DepthSnapshot, Box<dyn std::error::Error>> {
-        let sym = symbol.to_ascii_uppercase();
+        let sym = self.symbol.to_ascii_uppercase();
         let url = format!(
             "https://fapi.binance.com/fapi/v1/depth?symbol={sym}&limit={limit}"
         );
@@ -145,23 +146,24 @@ impl OrderBook {
     }
 
     /// Build a sorted book directly from a REST snapshot.
-    pub fn from_snapshot(mut self, snap: &DepthSnapshot) -> Self {
+    pub fn from_snapshot(&mut self, snap: &DepthSnapshot) {
         self.bids.clear();
         self.asks.clear();
+
+        self.last_u = Some(snap.lastUpdateId);
 
         for [p, q] in &snap.bids {
             let (p, q) = (Self::parse_f64(p), Self::parse_f64(q));
             if q != 0.0 {
-                ob.bids.insert(OF(p), q);
+                self.bids.insert(OF(p), q);
             }
         }
         for [p, q] in &snap.asks {
             let (p, q) = (Self::parse_f64(p), Self::parse_f64(q));
             if q != 0.0 {
-                ob.asks.insert(OF(p), q);
+                self.asks.insert(OF(p), q);
             }
         }
-        ob
     }
 
     /// Apply one WS depth update (absolute quantities).
@@ -188,7 +190,7 @@ impl OrderBook {
         self.last_u = Some(ev.u);
     }
     
-    pub fn filter_stream_checked<'a, S>(
+    pub fn filter_stream<'a, S>(
         &self,
         src: S,
     ) -> impl futures_util::Stream<Item = Result<DepthUpdate, ResyncNeeded>> + 'a
@@ -206,27 +208,29 @@ impl OrderBook {
             // 2) carry `prev_u` as stream state and validate `pu == prev_u`
             .scan(None, move |prev_u: &mut Option<u64>, du: DepthUpdate| {
                 let symbol = sym_for_err.clone();
-                async move {
-                    let out = match *prev_u {
-                        // if we already have a previous u, enforce continuity
-                        Some(prev) if du.pu != prev => {
-                            // break: tell caller to resnapshot
-                            Some(Err(ResyncNeeded {
-                                symbol,
-                                expected_pu: Some(prev),
-                                got_pu: du.pu,
-                                got_u: du.u,
-                            }))
-                        }
-                        // first message OR ok continuity → pass it through
-                        _ => {
-                            *prev_u = Some(du.u);
-                            Some(Ok(du))
-                        }
-                    };
-                    out
-                }
+            
+                // Decide the result synchronously, then return a ready future.
+                let res = match *prev_u {
+                    // If we already have a previous u, enforce continuity
+                    Some(prev) if du.pu != prev => {
+                        Some(Err(ResyncNeeded {
+                            symbol,
+                            expected_pu: Some(prev),
+                            got_pu: du.pu,
+                            got_u: du.u,
+                        }))
+                    }
+                    // First message OR continuity is OK → pass it through and advance prev_u
+                    _ => {
+                        *prev_u = Some(du.u);
+                        Some(Ok(du))
+                    }
+                };
+            
+                // Return a future that's immediately ready, avoiding any async/await here.
+                ready(res)
             })
+
     }
 
     fn parse_f64(s: &str) -> f64 {
