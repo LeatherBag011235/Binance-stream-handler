@@ -1,10 +1,11 @@
-use futures_util::{StreamExt, SinkExt, Stream};
+use futures_util::{StreamExt, SinkExt, Stream, pin_mut};
 use serde::Deserialize;
 use tokio_tungstenite::{connect_async};
 use tokio_tungstenite::tungstenite::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use futures_util::future::ready;
+use std::collections::HashMap;
 
 
 
@@ -75,6 +76,49 @@ pub fn create_ws_url(currency_pairs: &Vec<&str>,) -> String {
     url
 }
 
+pub fn start_router<S>(
+    stream: S,
+    symbols: &[&str],
+    chan_cap: usize,
+) -> (
+    tokio::task::JoinHandle<()>,
+    HashMap<String, mpsc::Receiver<DepthUpdate>>,
+)
+where
+    S: Stream<Item = CombinedDepthUpdate> + Send + 'static,
+{
+    // Make uppercase maps: symbol -> (tx, rx)
+    let mut tx_map: HashMap<String, mpsc::Sender<DepthUpdate>> = HashMap::new();
+    let mut rx_map: HashMap<String, mpsc::Receiver<DepthUpdate>> = HashMap::new();
+
+    for sym in symbols {
+        let key = sym.to_ascii_uppercase();
+        let (tx, rx) = mpsc::channel::<DepthUpdate>(chan_cap);
+        tx_map.insert(key.clone(), tx);
+        rx_map.insert(key, rx);
+    }
+    
+
+    // Move the sender map into the router task; return receivers to caller.
+    let mut stream = stream; // will be polled here
+    
+
+    let handle = tokio::spawn(async move {
+        pin_mut!(stream);
+        while let Some(env) = stream.next().await {
+            // Route by the symbol inside the message payload
+            let sym = env.data.s.to_ascii_uppercase();
+            if let Some(tx) = tx_map.get(&sym) {
+                // If the receiver is slow or dropped, this await applies backpressure
+                let _ = tx.send(env.data).await;
+            }
+            // else: symbol not registered → ignore
+        }
+    });
+
+    (handle, rx_map)
+}
+
 //////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -101,6 +145,12 @@ pub struct DepthSnapshot {
     bids: Vec<[String; 2]>, // [price, qty]
     asks: Vec<[String; 2]>,
 }
+#[derive(Debug)]
+pub enum UpdateDecision {
+    Drop,                       // ignore this event
+    Apply(DepthUpdate),         // apply to book
+    Resync(ResyncNeeded),       // trigger re-snapshot
+}
 
 
 #[derive(Debug, Clone)]
@@ -110,6 +160,7 @@ pub struct OrderBook {
     bids: BTreeMap<Price, Qty>,
     asks: BTreeMap<Price, Qty>,
     pub last_u: Option<u64>,
+    snapshot_id: Option<u64>,
 }
 
 impl OrderBook {
@@ -119,6 +170,7 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             last_u: None,
+            snapshot_id: None,
         }
     }
 
@@ -150,7 +202,7 @@ impl OrderBook {
         self.bids.clear();
         self.asks.clear();
 
-        self.last_u = Some(snap.lastUpdateId);
+        self.snapshot_id = Some(snap.lastUpdateId);
 
         for [p, q] in &snap.bids {
             let (p, q) = (Self::parse_f64(p), Self::parse_f64(q));
@@ -189,49 +241,65 @@ impl OrderBook {
         }
         self.last_u = Some(ev.u);
     }
-    
-    pub fn filter_stream<'a, S>(
-        &self,
-        src: S,
-    ) -> impl futures_util::Stream<Item = Result<DepthUpdate, ResyncNeeded>> + 'a
-    where
-        S: futures_util::Stream<Item = CombinedDepthUpdate> + 'a,
-    {
-        let sym_for_filter = self.symbol.clone();
-        let sym_for_err = self.symbol.clone();
 
-        // 1) keep only our symbol, unwrap to DepthUpdate
-        src.filter_map(move |env| {
-                let ok = env.data.s.eq_ignore_ascii_case(&sym_for_filter);
-                async move { if ok { Some(env.data) } else { None } }
-            })
-            // 2) carry `prev_u` as stream state and validate `pu == prev_u`
-            .scan(None, move |prev_u: &mut Option<u64>, du: DepthUpdate| {
-                let symbol = sym_for_err.clone();
-            
-                // Decide the result synchronously, then return a ready future.
-                let res = match *prev_u {
-                    // If we already have a previous u, enforce continuity
-                    Some(prev) if du.pu != prev => {
-                        Some(Err(ResyncNeeded {
-                            symbol,
-                            expected_pu: Some(prev),
-                            got_pu: du.pu,
-                            got_u: du.u,
-                        }))
-                    }
-                    // First message OR continuity is OK → pass it through and advance prev_u
-                    _ => {
-                        *prev_u = Some(du.u);
-                        Some(Ok(du))
-                    }
-                };
-            
-                // Return a future that's immediately ready, avoiding any async/await here.
-                ready(res)
-            })
 
+
+
+    pub fn continuity_check(
+        &mut self, 
+        du: DepthUpdate
+    ) -> UpdateDecision {
+
+        let snapshot_id = match self.snapshot_id {
+            None => {
+                self.last_u = None;
+                return UpdateDecision::Resync(ResyncNeeded {
+                    symbol: self.symbol.clone(), 
+                    expected_pu: None, 
+                    got_pu: du.pu, 
+                    got_u: du.u,
+                });
+                
+            }
+            Some(s) => s,            
+        };
+
+        match self.last_u {
+            None => {
+                if du.U <= snapshot_id && snapshot_id <= du.u {
+                    self.last_u = Some(du.u);
+                    return UpdateDecision::Apply(du);
+
+                } else if snapshot_id <= du.U  {
+                    self.last_u = None;
+                    return UpdateDecision::Resync(ResyncNeeded {
+                        symbol: self.symbol.clone(),
+                        expected_pu: None,
+                        got_pu: du.pu,
+                        got_u: du.u,
+                    })
+                } else {
+                    return UpdateDecision::Drop;
+                }
+            }
+
+            Some(pu) => {
+                if pu == du.pu {
+                    self.last_u = Some(du.u);
+                    return UpdateDecision::Apply(du);
+                } else {
+                    self.last_u = None;
+                    return UpdateDecision::Resync(ResyncNeeded {
+                        symbol: self.symbol.clone(),
+                        expected_pu: Some(pu),
+                        got_pu: du.pu,
+                        got_u: du.u,
+                    })
+                }
+            }
+        }
     }
+
 
     fn parse_f64(s: &str) -> f64 {
         // Binance sends clean numeric strings; unwrap is fine for now.
