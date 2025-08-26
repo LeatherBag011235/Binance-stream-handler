@@ -1,31 +1,17 @@
-use futures_util::{StreamExt, SinkExt, Stream};
+use futures_util::{pin_mut};
 use serde::Deserialize;
 use tokio_tungstenite::{connect_async};
 use tokio_tungstenite::tungstenite::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use futures_util::future::ready;
+use std::collections::HashMap;
+use futures_util::Stream;
+use futures_util::StreamExt;
+use futures_util::SinkExt;
 
-
-#[derive(Debug, Deserialize)]
-pub struct DepthUpdate {
-    pub e: String,    // Event type: "depthUpdate"
-    pub E: u64,       // Event time 
-    pub T: u64,       // Transaction time 
-    pub s: String,    // Symbol
-    pub U: u64,       // First update ID in event
-    pub u: u64,       // Final update ID in event
-    pub pu: u64,      // Final update Id in last stream(ie `u` in last stream)
-    pub b: Vec<[String; 2]>,   // bids updates [price, qty]
-    pub a: Vec<[String; 2]>,   // asks updates
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CombinedDepthUpdate {
-    // e.g. "adausdt@depth@100ms"
-    pub stream: String,
-    pub data: DepthUpdate,
-}
-
+use crate::order_book::DepthUpdate;
+use crate::order_book::CombinedDepthUpdate;
 
 pub async fn streaming(
     url: String,
@@ -57,7 +43,7 @@ pub async fn streaming(
     Ok(ReceiverStream::new(rx))
 }
 
-pub fn create_ws_url(currency_pairs: Vec<&str>,) -> String {
+pub fn create_ws_url(currency_pairs: &Vec<&str>,) -> String {
     let stream_spec = "@depth@100ms";
     let base_url = "wss://fstream.binance.com/stream?streams=";
 
@@ -67,9 +53,51 @@ pub fn create_ws_url(currency_pairs: Vec<&str>,) -> String {
         if i > 0 {
             url.push_str("/")
         }
-        println!("{}", i);
         url.push_str(&insert_str);
     }
 
     url
+}
+
+pub fn start_router<S>(
+    stream: S,
+    symbols: &[&str],
+    chan_cap: usize,
+) -> (
+    tokio::task::JoinHandle<()>,
+    HashMap<String, mpsc::Receiver<DepthUpdate>>,
+)
+where
+    S: Stream<Item = CombinedDepthUpdate> + Send + 'static,
+{
+    // Make uppercase maps: symbol -> (tx, rx)
+    let mut tx_map: HashMap<String, mpsc::Sender<DepthUpdate>> = HashMap::new();
+    let mut rx_map: HashMap<String, mpsc::Receiver<DepthUpdate>> = HashMap::new();
+
+    for sym in symbols {
+        let key = sym.to_ascii_uppercase();
+        let (tx, rx) = mpsc::channel::<DepthUpdate>(chan_cap);
+        tx_map.insert(key.clone(), tx);
+        rx_map.insert(key, rx);
+    }
+    
+
+    // Move the sender map into the router task; return receivers to caller.
+    let mut stream = stream; // will be polled here
+    
+
+    let handle = tokio::spawn(async move {
+        pin_mut!(stream);
+        while let Some(env) = stream.next().await {
+            // Route by the symbol inside the message payload
+            let sym = env.data.s.to_ascii_uppercase();
+            if let Some(tx) = tx_map.get(&sym) {
+                // If the receiver is slow or dropped, this await applies backpressure
+                let _ = tx.send(env.data).await;
+            }
+            // else: symbol not registered → ignore
+        }
+    });
+
+    (handle, rx_map)
 }

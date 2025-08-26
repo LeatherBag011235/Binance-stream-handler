@@ -1,43 +1,48 @@
 use futures_util::{StreamExt, SinkExt, Stream};
 
-use binance_stream_handler::{streaming, create_ws_url, start_router, OrderBook};
-
+use binance_stream_handler::streaming::{streaming, create_ws_url, start_router};
+use binance_stream_handler::order_book::{OrderBook, UpdateDecision};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let currency_pairs = vec!["adausdt", "dogeusdt"];
     let ws_url = create_ws_url(&currency_pairs);
-    let mut stream = streaming(ws_url).await?;
+    let stream = streaming(ws_url).await?;
     let (router, mut receivers) = start_router(stream, &currency_pairs, 1024);
 
-    let mut adausd_rx = receivers.remove("ADAUSDT").unwrap();
+    for pair in currency_pairs {
 
-    let mut orderbook = OrderBook::new(&currency_pairs[0]);
-    let snapshot = orderbook.get_depth_snapshot(1000).await?;
-    orderbook.from_snapshot(&snapshot);
+        let mut rx = receivers
+        .remove(&pair.to_ascii_uppercase())
+        .expect("router created a channel for every symbol");
 
-    while let Some(du) = adausd_rx.recv().await {
-        
-        println!("{:?}", du.s);
-        let res = orderbook.continuity_check(du);
-        println!("{:?}", res)
+        tokio::spawn(async move {
+            let mut ob =  match OrderBook::init_ob(&pair).await {
+                Ok(ob) => ob,
+                Err(e) => {
+                    eprintln!("[{pair}] snapshot init error: {e}");
+                    return;
+                }
+            };
+
+            while let Some(du) = rx.recv().await {
+                match ob.continuity_check(&du) {
+                    UpdateDecision::Drop => (),
+                    UpdateDecision::Apply(du) => ob.apply_update(du),
+                    UpdateDecision::Resync(info) => {
+                        eprintln!(
+                            "[{pair}] RESYNC: expected pu={:?}, got pu={}, u={}",
+                            info.expected_pu, info.got_pu, info.got_u
+                        );
+                        if let Err(e) = ob.resync_ob().await {
+                            eprintln!("[{}] resnapshot error: {e}", ob.symbol);
+                        }
+                    }
+                }
+            }
+        });
     }
 
-    
-    //println!("{:?}", orderbook.last_u);
-//
-    //let mut stream_checked = orderbook.filter_stream(stream).boxed();
-//
-    //while let Some(item) = stream_checked.next().await {
-//
-    //    match item {
-    //        Ok(du) => {
-    //            println!("{}", du.s);
-    //            orderbook.apply_update(&du);
-    //        }
-    //        Err(resync) => println!("resync needed for {}", resync.symbol),
-    //    }
-    //}
-    
+    futures_util::future::pending::<()>().await;
     Ok(())
 }

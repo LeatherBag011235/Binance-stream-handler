@@ -1,18 +1,54 @@
 use reqwest::Client;
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use ordered_float::OrderedFloat as OF;
+use serde::Deserialize;
 
 type Price = OF<f64>;
 type Qty   = f64;
 
 #[derive(Debug, Deserialize)]
-struct DepthSnapshot {
-    lastUpdateId: u64,
+pub struct DepthUpdate {
+    pub e: String,    // Event type: "depthUpdate"
+    pub E: u64,       // Event time 
+    pub T: u64,       // Transaction time 
+    pub s: String,    // Symbol
+    pub U: u64,       // First update ID in event
+    pub u: u64,       // Final update ID in event
+    pub pu: u64,      // Final update Id in last stream(ie `u` in last stream)
+    pub b: Vec<[String; 2]>,   // bids updates [price, qty]
+    pub a: Vec<[String; 2]>,   // asks updates
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CombinedDepthUpdate {
+    // e.g. "adausdt@depth@100ms"
+    pub stream: String,
+    pub data: DepthUpdate,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResyncNeeded {
+    pub symbol: String,
+    pub expected_pu: Option<u64>, // what we expected (prev u)
+    pub got_pu: u64,              // the pu we received
+    pub got_u: u64,               // the u we received
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DepthSnapshot {
+    #[serde(rename = "lastUpdateId")]
+    last_update_id: u64,
     E: u64, // event time (ms)
     T: u64, // transaction time (ms)
     bids: Vec<[String; 2]>, // [price, qty]
     asks: Vec<[String; 2]>,
+}
+
+#[derive(Debug)]
+pub enum UpdateDecision<'a>{
+    Drop,                       // ignore this event
+    Apply(&'a DepthUpdate),         // apply to book
+    Resync(ResyncNeeded),       // trigger re-snapshot
 }
 
 
@@ -23,6 +59,8 @@ pub struct OrderBook {
     bids: BTreeMap<Price, Qty>,
     asks: BTreeMap<Price, Qty>,
     pub last_u: Option<u64>,
+    snapshot_id: Option<u64>,
+    depth: u16
 }
 
 impl OrderBook {
@@ -32,14 +70,33 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             last_u: None,
+            snapshot_id: None,
+            depth: 1000,
         }
     }
 
+    pub async fn init_ob(
+        symbol: &str
+    ) -> Result<OrderBook, Box<dyn std::error::Error>> {
+        let mut ob = OrderBook::new(symbol);
+        let snapshot = ob.get_depth_snapshot(ob.depth).await?;
+        ob.from_snapshot(&snapshot);
+        Ok(ob)
+    }
+
+    pub async fn resync_ob(
+        &mut self
+    ) -> Result<(), Box<dyn std::error::Error>>{
+        let new_snapshot = self.get_depth_snapshot(self.depth).await?;
+        self.from_snapshot(&new_snapshot);
+        Ok(())
+    }
+
     pub async fn get_depth_snapshot(
-        symbol: &str,
+        &self,
         limit: u16,
     ) -> Result<DepthSnapshot, Box<dyn std::error::Error>> {
-        let sym = symbol.to_ascii_uppercase();
+        let sym = self.symbol.to_ascii_uppercase();
         let url = format!(
             "https://fapi.binance.com/fapi/v1/depth?symbol={sym}&limit={limit}"
         );
@@ -59,23 +116,24 @@ impl OrderBook {
     }
 
     /// Build a sorted book directly from a REST snapshot.
-    pub fn from_snapshot(mut self, snap: &DepthSnapshot) -> Self {
-        self.bids.clear()
-        self.asks.clear()
+    pub fn from_snapshot(&mut self, snap: &DepthSnapshot) {
+        self.bids.clear();
+        self.asks.clear();
+
+        self.snapshot_id = Some(snap.last_update_id);
 
         for [p, q] in &snap.bids {
             let (p, q) = (Self::parse_f64(p), Self::parse_f64(q));
             if q != 0.0 {
-                ob.bids.insert(OF(p), q);
+                self.bids.insert(OF(p), q);
             }
         }
         for [p, q] in &snap.asks {
             let (p, q) = (Self::parse_f64(p), Self::parse_f64(q));
             if q != 0.0 {
-                ob.asks.insert(OF(p), q);
+                self.asks.insert(OF(p), q);
             }
         }
-        ob
     }
 
     /// Apply one WS depth update (absolute quantities).
@@ -101,9 +159,60 @@ impl OrderBook {
         }
         self.last_u = Some(ev.u);
     }
-    pub fn is_mine(&self, resived: CombinedDepthUpdate) -> DepthUpdate {
-        if resived.data.s.eq_ignore_ascii_case(&self.symbol):
-            
+
+    pub fn continuity_check<'a>(
+        &mut self, 
+        du: &'a DepthUpdate
+    ) -> UpdateDecision<'a> {
+
+        let snapshot_id = match self.snapshot_id {
+            None => {
+                self.last_u = None;
+                return UpdateDecision::Resync(ResyncNeeded {
+                    symbol: self.symbol.clone(), 
+                    expected_pu: None, 
+                    got_pu: du.pu, 
+                    got_u: du.u,
+                });
+                
+            }
+            Some(s) => s,            
+        };
+
+        match self.last_u {
+            None => {
+                if du.U <= snapshot_id && snapshot_id <= du.u {
+                    self.last_u = Some(du.u);
+                    return UpdateDecision::Apply(&du);
+
+                } else if snapshot_id <= du.U  {
+                    self.last_u = None;
+                    return UpdateDecision::Resync(ResyncNeeded {
+                        symbol: self.symbol.clone(),
+                        expected_pu: None,
+                        got_pu: du.pu,
+                        got_u: du.u,
+                    })
+                } else {
+                    return UpdateDecision::Drop;
+                }
+            }
+
+            Some(pu) => {
+                if pu == du.pu {
+                    self.last_u = Some(du.u);
+                    return UpdateDecision::Apply(&du);
+                } else {
+                    self.last_u = None;
+                    return UpdateDecision::Resync(ResyncNeeded {
+                        symbol: self.symbol.clone(),
+                        expected_pu: Some(pu),
+                        got_pu: du.pu,
+                        got_u: du.u,
+                    })
+                }
+            }
+        }
     }
 
     fn parse_f64(s: &str) -> f64 {
