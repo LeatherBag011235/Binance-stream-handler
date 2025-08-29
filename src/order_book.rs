@@ -6,7 +6,7 @@ use serde::Deserialize;
 type Price = OF<f64>;
 type Qty   = f64;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct DepthUpdate {
     pub e: String,    // Event type: "depthUpdate"
     pub E: u64,       // Event time 
@@ -19,7 +19,7 @@ pub struct DepthUpdate {
     pub a: Vec<[String; 2]>,   // asks updates
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct CombinedDepthUpdate {
     // e.g. "adausdt@depth@100ms"
     pub stream: String,
