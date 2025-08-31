@@ -9,9 +9,11 @@ use std::collections::HashMap;
 
 pub mod order_book;
 pub mod streaming;
+pub mod router;
 
 use crate::order_book::{OrderBook, DepthUpdate, CombinedDepthUpdate, UpdateDecision};
 use crate::streaming::{create_ws_url, streaming};
+use crate::router::{};
 
 pub async fn init_stream(
     currency_pairs: &[&str]
@@ -23,6 +25,11 @@ pub async fn init_stream(
     let stream = streaming(ws_url).await?;
     Ok(stream)
 }
+
+
+
+
+
 
 
 pub fn init_order_books(

@@ -202,6 +202,8 @@ impl OrderBook {
                 if pu == du.pu {
                     self.last_u = Some(du.u);
                     return UpdateDecision::Apply(&du);
+                } else if pu > du.pu {
+                    return UpdateDecision::Drop;
                 } else {
                     self.last_u = None;
                     return UpdateDecision::Resync(ResyncNeeded {
