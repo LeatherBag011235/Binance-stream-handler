@@ -56,11 +56,11 @@ pub enum UpdateDecision<'a>{
 pub struct OrderBook {
     pub symbol: String,
     // Sorted by price ascending (wrapped so it implements Ord)
-    bids: BTreeMap<Price, Qty>,
-    asks: BTreeMap<Price, Qty>,
+    pub bids: BTreeMap<Price, Qty>,
+    pub asks: BTreeMap<Price, Qty>,
     pub last_u: Option<u64>,
-    snapshot_id: Option<u64>,
-    depth: u16
+    pub snapshot_id: Option<u64>,
+    pub depth: u16
 }
 
 impl OrderBook {

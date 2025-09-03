@@ -2,10 +2,14 @@ use futures_util::{StreamExt, SinkExt, Stream, pin_mut};
 use serde::Deserialize;
 use tokio_tungstenite::{connect_async};
 use tokio_tungstenite::tungstenite::Message;
-use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use futures_util::future::ready;
 use std::collections::HashMap;
+use tokio::sync::{mpsc, watch};
+use tracing::{info, debug, error, warn, trace};
+use tracing::Instrument;
+use tracing::{info_span}; 
+
 
 pub mod order_book;
 pub mod streaming;
@@ -27,19 +31,20 @@ pub async fn init_stream(
 }
 
 
-
-
-
-
-
 pub fn init_order_books(
     currency_pairs: &'static [&'static str], 
     mut receivers: HashMap<String, mpsc::Receiver<DepthUpdate>>,
-) {
+) -> HashMap<String, watch::Receiver<OrderBook>> {
+    let mut ob_streams: HashMap<String, watch::Receiver<OrderBook>> = HashMap::new();
+
     for &pair in currency_pairs {
+        let pair_up = pair.to_ascii_uppercase();
         let mut rx = receivers
-        .remove(&pair.to_ascii_uppercase())
+        .remove(&pair_up)
         .expect("router created a channel for every symbol");
+
+        let (tx_ob, rx_ob) = watch::channel(OrderBook::new(pair));
+        ob_streams.insert(pair_up.clone(), rx_ob);
 
         tokio::spawn(async move {
             let mut ob =  match OrderBook::init_ob(pair).await {
@@ -49,23 +54,45 @@ pub fn init_order_books(
                     return;
                 }
             };
+
+            let _ = tx_ob.send_replace(ob);
+
             while let Some(du) = rx.recv().await {
-                match ob.continuity_check(&du) {
-                    UpdateDecision::Drop => (),
-                    UpdateDecision::Apply(du) => ob.apply_update(du),
-                    UpdateDecision::Resync(info) => {
-                        eprintln!(
-                            "[{pair}] RESYNC: expected pu={:?}, got pu={}, u={}",
-                            info.expected_pu, info.got_pu, info.got_u
-                        );
-                        if let Err(e) = ob.resync_ob().await {
-                            eprintln!("[{}] resnapshot error: {e}", ob.symbol);
+                let mut need_resync = false;
+
+                let _ = tx_ob.send_modify(|book| {
+                    match book.continuity_check(&du) {
+                        UpdateDecision::Drop => {trace!("Update dropped");},
+                        UpdateDecision::Apply(du) => {
+                            trace!("Update applied");
+                            book.apply_update(du);
+                        }
+                        UpdateDecision::Resync(info) => {
+                            trace!("Resync required");
+                            eprintln!(
+                                "[{pair}] RESYNC: expected pu={:?}, got pu={}, u={}",
+                                info.expected_pu, info.got_pu, info.got_u
+                            );
+                            need_resync = true;
+
                         }
                     }
+                });
+
+                if need_resync {
+                    let fresh_ob = match OrderBook::init_ob(pair).await {
+                        Ok(ob) => ob,
+                        Err(e) => {
+                            eprintln!("[{pair}] snapshot init error: {e}");
+                            return;
+                        }
+                    };
+                    let _ = tx_ob.send_replace(fresh_ob);
                 }
             }
-        });
+        }.instrument(info_span!("orderbook_task", symbol = %pair)));
     }
+    ob_streams
 }
 
 

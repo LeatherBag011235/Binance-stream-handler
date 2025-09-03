@@ -2,6 +2,9 @@ use std::{collections::{HashMap, VecDeque}, time::{Duration, Instant}};
 use futures_util::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::order_book::{DepthUpdate, CombinedDepthUpdate};
+
+
 pub enum RouterCmd {
     BeginCutover { drain_for: Duration },
 }
@@ -92,15 +95,47 @@ where
                         }
                         None => {
                             // primary ended → flush parked secondary and flip immediately
-                            for (sym, buf) in park.iter_mut() { ... }
+                            for (sym, buf) in park.iter_mut() {
+                                if let Some(tx) = out_map.get(sym) {
+                                    while let Some(du) = buf.pop_front() {
+                                        let _ = tx.send(du).await;
+                                    }
+                                } else {
+                                    buf.clear();
+                                }
+                            }
                             mode = Mode::SecondaryOnly;
                         }
                     }
                 }
-                s = secondary.next() => { ... }
+                s = secondary.next() => {
+                    match s {
+                        Some(env) => {
+                            let sym = env.data.s.to_ascii_uppercase();
+                            match mode {
+                                Mode::SecondaryWarm | Mode::DrainingPrimary { .. } => {
+                                    // park bounded; on overflow drop oldest
+                                    if let Some(buf) = park.get_mut(&sym) {
+                                        if buf.len() >= park_cap { buf.pop_front(); }
+                                        buf.push_back(env.data);
+                                    }
+                                }
+                                Mode::SecondaryOnly => {
+                                    // after flip: forward directly
+                                    if let Some(tx) = out_map.get(&sym) {
+                                        let _ = tx.send(env.data).await;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            // secondary ended unexpectedly; minimal handling is to ignore here.
+                            // reconnection policy can live outside.
+                        }
+                    }
+                }
             }
         }
     });
-
-
+    (handle, rx_map)
 }
