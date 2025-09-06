@@ -10,26 +10,13 @@ use tracing::{info, debug, error, warn, trace};
 use tracing::Instrument;
 use tracing::{info_span}; 
 
-
 pub mod order_book;
 pub mod streaming;
 pub mod router;
 
 use crate::order_book::{OrderBook, DepthUpdate, CombinedDepthUpdate, UpdateDecision};
-use crate::streaming::{create_ws_url, streaming};
+//use crate::streaming::{create_ws_url, streaming};
 use crate::router::{};
-
-pub async fn init_stream(
-    currency_pairs: &[&str]
-) -> Result<impl futures_util::Stream<Item = CombinedDepthUpdate>, Box<dyn std::error::Error>> {
-    let lower: Vec<String> = currency_pairs.iter().map(|s| s.to_lowercase()).collect();
-    let currency_lower: Vec<&str> = lower.iter().map(|s| s.as_str()).collect();
-    
-    let ws_url = create_ws_url(&currency_lower);
-    let stream = streaming(ws_url).await?;
-    Ok(stream)
-}
-
 
 pub fn init_order_books(
     currency_pairs: &'static [&'static str], 
@@ -54,32 +41,12 @@ pub fn init_order_books(
                     return;
                 }
             };
-
+            let mut need_resync = false;
             let _ = tx_ob.send_replace(ob);
 
             while let Some(du) = rx.recv().await {
-                let mut need_resync = false;
 
-                let _ = tx_ob.send_modify(|book| {
-                    match book.continuity_check(&du) {
-                        UpdateDecision::Drop => {trace!("Update dropped");},
-                        UpdateDecision::Apply(du) => {
-                            trace!("Update applied");
-                            book.apply_update(du);
-                        }
-                        UpdateDecision::Resync(info) => {
-                            trace!("Resync required");
-                            eprintln!(
-                                "[{pair}] RESYNC: expected pu={:?}, got pu={}, u={}",
-                                info.expected_pu, info.got_pu, info.got_u
-                            );
-                            need_resync = true;
-
-                        }
-                    }
-                });
-
-                if need_resync {
+                if need_resync {                    
                     let fresh_ob = match OrderBook::init_ob(pair).await {
                         Ok(ob) => ob,
                         Err(e) => {
@@ -88,8 +55,28 @@ pub fn init_order_books(
                         }
                     };
                     let _ = tx_ob.send_replace(fresh_ob);
+                    need_resync = false;
+                } else {
+                    let _ = tx_ob.send_modify(|book| {
+                        match book.continuity_check(&du) {
+                            UpdateDecision::Drop => {trace!("Update dropped");},
+                            UpdateDecision::Apply(du) => {
+                                trace!("Update applied");
+                                book.apply_update(du);
+                            }
+                            UpdateDecision::Resync(info) => {
+                                trace!("Resync required");
+                                eprintln!(
+                                    "[{pair}] RESYNC: expected pu={:?}, got pu={}, u={}",
+                                    info.expected_pu, info.got_pu, info.got_u
+                                );
+                                need_resync = true;
+                            }
+                        }
+                    });
                 }
             }
+
         }.instrument(info_span!("orderbook_task", symbol = %pair)));
     }
     ob_streams
