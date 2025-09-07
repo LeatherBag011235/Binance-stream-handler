@@ -1,48 +1,36 @@
-use std::{collections::{HashMap, VecDeque}, time::{Duration, Instant}};
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration as StdDur, Instant};
 use futures_util::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch};
-
+use tokio::time::sleep;
 use futures_util::pin_mut;
-use chrono::{NaiveTime, Timelike, Utc, Duration};
+use chrono::{NaiveTime, Timelike, Utc, Duration as ChronoDur};
+use tracing::{info, debug, error, warn, trace};
 
 use crate::order_book::{DepthUpdate, CombinedDepthUpdate};
 use crate::streaming::{TimedStream};
-use tokio::time::{sleep, Duration as StdDur};
 
 
-pub enum RouterCmd {
-    BeginCutover { drain_for: Duration },
-}
-
-pub struct RouterHandle {
-    tx: mpsc::UnboundedSender<RouterCmd>
-}
-
-impl RouterHandle {
-    pub fn begin_cutover(&self, drain_for: Duration) {
-        let _=self.tx.send(RouterCmd::BeginCutover { drain_for });
-    }
-}
-
+#[derive(Clone, Copy, Debug)]
 enum Mode {
     OnlyA,
     BothAB,
     OnlyB,
 }
 
-pub struct DualRouter<'a> {
+pub struct DualRouter {
     pub switch_cutoff: (NaiveTime, NaiveTime),
-    pub currency_pairs: &'a [&'a str],
-    stream_a: TimedStream<'a>,
-    stream_b: TimedStream<'a>,
+    pub currency_pairs: &'static [&'static str],
+    stream_a: TimedStream,
+    stream_b: TimedStream,
 }
 
 
-impl<'a> DualRouter<'a> {
+impl DualRouter {
 
     pub fn new(
         switch_cutoff: (NaiveTime, NaiveTime),
-        currency_pairs: &'a [&'a str],
+        currency_pairs: &'static [&'static str],
     ) -> Self {
         let life_span_a = switch_cutoff;
         let life_span_b = (switch_cutoff.1, switch_cutoff.0);
@@ -61,46 +49,6 @@ impl<'a> DualRouter<'a> {
             currency_pairs,
             stream_a,
             stream_b,
-        }
-    }
-
-    fn in_window(t: NaiveTime, start: NaiveTime, end: NaiveTime) -> bool {
-        if start <= end {
-            t >= start && t < end
-        } else {
-            // wraps midnight
-            t >= start || t < end
-        }
-    }
-
-    async fn rout_mode(
-        &self,
-        ctrl_tx: &tokio::sync::watch::Sender<Mode>,
-    ) {
-        let (cut_a, cut_b) = self.switch_cutoff;
-        let win_a_start = cut_a
-            .checked_sub_signed(Duration::seconds(3))
-            .unwrap_or(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-        let win_b_start = cut_b
-            .checked_sub_signed(Duration::seconds(3))
-            .unwrap_or(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-
-        loop {
-            let now_tod: NaiveTime = Utc::now().time();
-
-            let in_double_a = in_window(now_tod, win_a_start, cut_a.saturating_add_signed(Duration::seconds(1)));
-            let in_double_b = in_window(now_tod, win_b_start, cut_b.saturating_add_signed(Duration::seconds(1)));
-
-            if in_double_a || in_double_b {
-                let _ = ctrl_tx.send_replace(Mode::BothAB);
-            } else if in_window(now_tod, cut_a, cut_b) {
-                let _ = ctrl_tx.send_replace(Mode::OnlyA);
-            } else {
-                let _ = ctrl_tx.send_replace(Mode::OnlyB);
-            }
-
-            // Tick roughly once per second; adjust as needed
-            sleep(StdDur::from_millis(250)).await;
         }
     }
 
@@ -125,17 +73,97 @@ impl<'a> DualRouter<'a> {
 
         let (ctrl_tx, ctrl_rx) = watch::channel(Mode::OnlyA);
 
-        rout_mode(ctrl_tx);
+        let switch_cutoff = self.switch_cutoff;
+        tokio::spawn(rout_mode(switch_cutoff, ctrl_tx));
 
-        loop {
-            match ctrl_rx {...}
-        }
+        tokio::spawn(async move {
+            loop {
+                let current_stream = match ctrl {
+                    Mode::OnlyA => {
+                        match self.stream_a.init_stream().await {
+                            Ok(stream) => {stream}
+                            Err(e) => {error!("{e}");}
+                        }
+                    }                   
+                    Mode::OnlyB => {
+                        match self.stream_b.init_stream().await {
+                            Ok(stream) => {stream}
+                            Err(e) => {error!("{e}");}
+                        }
+                    }
+                    Mode::BothAB=> {
+                        match self.stream_a.init_stream().await {
+                            Ok(stream) => {stream}
+                            Err(e) => {error!("{e}");}
+                        }
+                        match self.stream_b.init_stream().await {
+                            Ok(stream) => {stream}
+                            Err(e) => {error!("{e}");}
+                        }
+                    };
+                }
+            }
+        });
+
+
+
 
     }
-
-    
 }
 
+async fn rout_mode(
+    switch_cutoff: (NaiveTime, NaiveTime),
+    mut ctrl_tx: tokio::sync::watch::Sender<Mode>,
+) {
+    let (cut_a, cut_b) = switch_cutoff;
+    let win_a_start= sub_secs_wrap(cut_a, 3);
+    let win_b_start= sub_secs_wrap(cut_b, 3);
+
+    loop {
+        let now_tod: NaiveTime = Utc::now().time();
+        let in_double_a = in_window(
+            now_tod, 
+            win_a_start, 
+            cut_a,
+        );
+        let in_double_b = in_window(
+            now_tod, 
+            win_b_start, 
+            cut_b,
+        );
+
+        if in_double_a || in_double_b {
+            let _ = ctrl_tx.send_replace(Mode::BothAB);
+        } else if in_window(now_tod, cut_a, cut_b) {
+            let _ = ctrl_tx.send_replace(Mode::OnlyA);
+        } else {
+            let _ = ctrl_tx.send_replace(Mode::OnlyB);
+        }
+        // Tick roughly once per second; adjust as needed
+        sleep(StdDur::from_millis(250)).await;
+    }
+}
+
+#[inline]
+fn in_window(t: NaiveTime, start: NaiveTime, end: NaiveTime) -> bool {
+    if start <= end {
+        t >= start && t < end
+    } else {
+        // wraps midnight
+        t >= start || t < end
+    }
+}
+
+#[inline]
+fn sub_secs_wrap(t: NaiveTime, secs: i64) -> NaiveTime {
+    const DAY: i64 = 24 * 60 * 60;
+    let cur = t.num_seconds_from_midnight() as i64;
+    let mut s = (cur - secs) % DAY;
+    if s < 0 { s += DAY; }
+    NaiveTime::from_num_seconds_from_midnight_opt(s as u32, 0).unwrap()
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
 pub fn start_dual_router<S1, S2>(
         mut primary: S1,
         mut secondary: S2,

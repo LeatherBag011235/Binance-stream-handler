@@ -15,12 +15,12 @@ use chrono::NaiveTime;
 use crate::order_book::DepthUpdate;
 use crate::order_book::CombinedDepthUpdate;
 
-pub struct TimedStream<'a>  {
-    pub currency_pairs: &'a [&'a str],
+pub struct TimedStream  {
+    pub currency_pairs: &'static [&'static str],
     pub life_span: (NaiveTime, NaiveTime),
 }
 
-impl<'a> TimedStream<'a> { 
+impl TimedStream { 
     pub async fn init_stream(
         &self
     ) -> Result<impl Stream<Item = CombinedDepthUpdate> + Send + 'static, Box<dyn std::error::Error>> {
