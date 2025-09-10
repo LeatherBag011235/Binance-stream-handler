@@ -76,31 +76,118 @@ impl DualRouter {
         let switch_cutoff = self.switch_cutoff;
         tokio::spawn(rout_mode(switch_cutoff, ctrl_tx));
 
+        
+
+        let currency_pairs = self.currency_pairs;
+        let life_span_a = self.stream_a.life_span;
+        let life_span_b = self.stream_b.life_span;
+
+
+
         tokio::spawn(async move {
-            loop {
-                let current_stream = match ctrl {
-                    Mode::OnlyA => {
-                        match self.stream_a.init_stream().await {
-                            Ok(stream) => {stream}
-                            Err(e) => {error!("{e}");}
-                        }
-                    }                   
-                    Mode::OnlyB => {
-                        match self.stream_b.init_stream().await {
-                            Ok(stream) => {stream}
-                            Err(e) => {error!("{e}");}
-                        }
+            enum Active { A, B}
+            let mut active: Option<Active> = None;
+
+            // Lazily-opened runtime streams
+            type DynDepth = Pin<Box<dyn Stream<Item = CombinedDepthUpdate> + Send>>;
+            let mut stream_a: Option<DynDepth> = None;
+            let mut stream_b: Option<DynDepth> = None;
+
+            // capture the configured per-symbol bound
+            let park_cap_local = park.values().next().map(|v| v.capacity()).unwrap_or(0);
+            
+            // helper: open A on demand
+            let mut open_a = || async {
+                if stream_a.is_none() {
+                    let mut builder = TimedStream { currency_pairs, life_span: life_span_a};
+                    if let Ok(s) = builder.init_stream().await {
+                        stream_a = Some(Box::pin(s));
                     }
-                    Mode::BothAB=> {
-                        match self.stream_a.init_stream().await {
-                            Ok(stream) => {stream}
-                            Err(e) => {error!("{e}");}
+                }
+            };
+            // helper: open B on demand
+            let mut open_b = || async {
+                if stream_b.is_none() {
+                    let mut builder = TimedStream { currency_pairs, life_span: life_span_b };
+                    if let Ok(s) = builder.init_stream().await {
+                        stream_b = Some(Box::pin(s));
+                    }
+                }
+            };
+            // helper: flush parked updates FIFO into out_map
+            let mut flush_park = |
+            out_map: &mut HashMap<String, mpsc::Sender<DepthUpdate>>,
+            park: &mut HashMap<String, VecDeque<DepthUpdate>>| async {
+                for (sym, buf) in park.iter_mut() {
+                    if let Some(tx) = out_map.get(sym) {
+                        while let Some(du) = buf.pop_front() {
+                            let _ = tx.send(du).await;
                         }
-                        match self.stream_b.init_stream().await {
-                            Ok(stream) => {stream}
-                            Err(e) => {error!("{e}");}
+                    } else {
+                        buf.clear();
+                    }
+                }
+            }
+            // 5) align to current mode immediately
+            let mut mode = *ctrl_rx.borrow();
+            match mode {
+                Mode::OnlyA => {
+                    (open_a)().await;
+                    stream_b = None;
+                    active = Some(Active:A);
+                    (flush_park)(&mut out_map, &mut park).await;
+                }
+                Mode::OnlyB => {
+                    (open_b)().await;
+                    stream_a = None;
+                    active = Some(Active::B);
+                    (flush_park)(&mut out_map, &mut park).await;
+                }
+                Mode::BothAB => {
+                    (open_a)().await;
+                    (open_b)().await;
+                    active = Some(Active::A);
+                }
+            }
+
+            // 6) main loop: react to mode changes and stream events
+            loop {
+                tokio::select! {
+                    // 6a) time-based mode change
+                    changed = ctrl_rx.changed() => {
+                        if changed.is_err() { break; }
+                        let new_mode = *ctrl_rx.borrow_and_update();
+
+                        match (mode, new_mode) {
+                            (Mode::OnlyA, Mode:: BothAB) => {
+                                (open_b).await;
+                                active = Some(Active::A);
+                            }
+                            (Mode::BothAB, Mode::OnlyB) => {
+                                (flush_park)(&mut out_map, &mut park).await 
+                                stream_a = None;
+                                (open_b)().await;
+                                active = Some(Active::B);
+                            }
+                            (Mode::OnlyB, Mode::BothAB) => {
+                                (open_a)().await;
+                                active = Some(Active::B)
+                            }
+                            (Mode::BothAB, Mode::OnlyA) => {
+                                (flush_park)(&mut out_map, &mut park).await;
+                                stream_b = None;
+                                (open_a)().await;
+                                active = Some(Active::A);
+                            }
+                            _ => {panick!("Unexpected Mode (stream line) switch from {} to {}", mode, new_mode);}
+
                         }
-                    };
+                        mode = new_mode;
+                    }
+                    // 6b) Stream A events
+                    maybe_env = async {
+                        if let Some(s) = &mut stream_a { s.next()}
+                    }
                 }
             }
         });
