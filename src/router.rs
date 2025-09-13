@@ -13,7 +13,7 @@ use crate::streaming::{TimedStream};
 
 type DynDepth = Pin<Box<dyn Stream<Item = CombinedDepthUpdate> + Send>>;
 
-#[derive(Clone, Copy, Debug,)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     OnlyA,
     BothAB,
@@ -100,37 +100,6 @@ impl DualRouter {
             let mut pending_mode: Option<Mode> = None; 
             let mut mode = *ctrl_rx.borrow();
 
-            let mut apply_transition = |old: Mode, new: Mode| async {
-                match (old, new) {
-                    // OnlyA → BothAB: keep A primary, open B (start parking B)
-                    (Mode::OnlyA, Mode::BothAB) => {
-                        open_stream(&mut stream_b, currency_pairs, life_span_b).await;
-                        active = Some(Active::A);
-                    }
-                    // BothAB → OnlyB: flush parked (B), close A, A→None, B becomes primary
-                    (Mode::BothAB, Mode::OnlyB) => {
-                        flush_park(&mut out_map, &mut park).await;
-                        stream_a = None;
-                        open_stream(&mut stream_b, currency_pairs, life_span_b).await;
-                        active = Some(Active::B);
-                    }
-                    // OnlyB → BothAB: keep B primary, open A (start parking A)
-                    (Mode::OnlyB, Mode::BothAB) => {
-                        open_stream(&mut stream_a, currency_pairs, life_span_a).await;
-                        active = Some(Active::B);
-                    }
-                    // BothAB → OnlyA: flush parked (A), close B, B→None, A becomes primary
-                    (Mode::BothAB, Mode::OnlyA) => {
-                        flush_park(&mut out_map, &mut park).await;
-                        stream_b = None;
-                        open_stream(&mut stream_a, currency_pairs, life_span_a).await;
-                        active = Some(Active::A);
-                    }
-                    _ => { panic!("Unexpected channel/mode switch from {:?} to {:?}", old, new); }
-                }
-                new
-            };
-
             match mode {
                 Mode::OnlyA => {
                     open_stream(&mut stream_a, currency_pairs, life_span_a).await;
@@ -154,7 +123,13 @@ impl DualRouter {
             // 6) main loop: react to mode changes and stream events
             loop {
                 if let Some(new_mode) = pending_mode.take() {
-                    mode = apply_transition(mode, new_mode).await;
+                    mode = apply_transition(
+                        mode, new_mode,
+                        &mut active,
+                        &mut stream_a, &mut stream_b,
+                        currency_pairs, life_span_a, life_span_b,
+                        &mut out_map, &mut park,
+                    ).await;
                 }
 
                 let a_open = stream_a.is_some();
@@ -200,7 +175,7 @@ impl DualRouter {
                                 }
                             }
                             None => {
-                                stream_a = None;
+                                //stream_a = None;
                             }
                         }
                     }
@@ -236,7 +211,7 @@ impl DualRouter {
                                 }
                             }
                             None => {
-                                stream_b = None;
+                                //stream_b = None;
                             }
                         }
                     }
@@ -245,6 +220,54 @@ impl DualRouter {
         });
         rx_map
     }
+}
+
+async fn apply_transition(
+    old: Mode, 
+    new: Mode,
+    active: &mut Option<Active>,
+    stream_a: &mut Option<DynDepth>,
+    stream_b: &mut Option<DynDepth>,
+    currency_pairs: &'static [&'static str], 
+    life_span_a: (NaiveTime, NaiveTime),
+    life_span_b: (NaiveTime, NaiveTime),
+    out_map: &mut HashMap::<String, mpsc::Sender<DepthUpdate>>,
+    park: &mut HashMap<String, VecDeque<DepthUpdate>>,
+) -> Mode {
+
+    match (old, new) {
+        (o, n) if o == n => {
+            trace!("Pseudo mode flip occured");
+            return n 
+        },
+        // OnlyA → BothAB: keep A primary, open B (start parking B)
+        (Mode::OnlyA, Mode::BothAB) => {
+            open_stream(stream_b, currency_pairs, life_span_b).await;
+            *active = Some(Active::A);
+        }
+        // BothAB → OnlyB: flush parked (B), close A, A→None, B becomes primary
+        (Mode::BothAB, Mode::OnlyB) => {
+            flush_park(out_map, park).await;
+            *stream_a = None;
+            open_stream(stream_b, currency_pairs, life_span_b).await;
+            *active = Some(Active::B);
+        }
+        // OnlyB → BothAB: keep B primary, open A (start parking A)
+        (Mode::OnlyB, Mode::BothAB) => {
+            open_stream(stream_a, currency_pairs, life_span_a).await;
+            *active = Some(Active::B);
+        }
+        // BothAB → OnlyA: flush parked (A), close B, B→None, A becomes primary
+        (Mode::BothAB, Mode::OnlyA) => {
+            flush_park(out_map, park).await;
+            *stream_b = None;
+            open_stream(stream_a, currency_pairs, life_span_a).await;
+            *active = Some(Active::A);
+        }
+        _ => { panic!("Unexpected channel/mode switch from {:?} to {:?}", old, new); }
+    }
+    
+    new
 }
 
 async fn open_stream(
@@ -283,8 +306,11 @@ async fn rout_mode(
     let win_a_start= sub_secs_wrap(cut_a, 3);
     let win_b_start= sub_secs_wrap(cut_b, 3);
 
+    let mut last_sent: Option<Mode> = Some(Mode::OnlyA);
+
     loop {
         let now_tod: NaiveTime = Utc::now().time();
+
         let in_double_a = in_window(
             now_tod, 
             win_a_start, 
@@ -296,12 +322,17 @@ async fn rout_mode(
             cut_b,
         );
 
-        if in_double_a || in_double_b {
-            let _ = ctrl_tx.send_replace(Mode::BothAB);
-        } else if in_window(now_tod, cut_a, cut_b) {
-            let _ = ctrl_tx.send_replace(Mode::OnlyA);
+        let new_mode = if in_double_a || in_double_b {
+            Mode::BothAB
+        } else if in_window (now_tod, cut_a, cut_b) {
+            Mode::OnlyA
         } else {
-            let _ = ctrl_tx.send_replace(Mode::OnlyB);
+            Mode::OnlyB
+        };
+
+        if last_sent != Some(new_mode) {
+            let _ = ctrl_tx.send_replace(new_mode);
+            last_sent = Some(new_mode);
         }
         // Tick roughly once per second; adjust as needed
         sleep(StdDur::from_millis(250)).await;

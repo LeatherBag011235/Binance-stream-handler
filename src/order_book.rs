@@ -2,6 +2,7 @@ use reqwest::Client;
 use std::collections::BTreeMap;
 use ordered_float::OrderedFloat as OF;
 use serde::Deserialize;
+use tracing::{info, debug, error, warn, trace};
 
 type Price = OF<f64>;
 type Qty   = f64;
@@ -186,6 +187,10 @@ impl OrderBook {
                     return UpdateDecision::Apply(&du);
 
                 } else if snapshot_id <= du.U  {
+                    debug!(
+                        "Missed updates after initialization for {}, snap_id: {:?} U: {} u: {}", 
+                        du.s, snapshot_id, du.U, du.u,
+                    );
                     self.last_u = None;
                     return UpdateDecision::Resync(ResyncNeeded {
                         symbol: self.symbol.clone(),

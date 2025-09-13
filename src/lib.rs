@@ -35,7 +35,10 @@ pub fn init_order_books(
 
         tokio::spawn(async move {
             let mut ob =  match OrderBook::init_ob(pair).await {
-                Ok(ob) => ob,
+                Ok(ob) => {
+                    debug!("{} orderbook is initiated, last Id: {:?}", ob.symbol, ob.snapshot_id);
+                    ob
+                },
                 Err(e) => {
                     eprintln!("[{pair}] snapshot init error: {e}");
                     return;
