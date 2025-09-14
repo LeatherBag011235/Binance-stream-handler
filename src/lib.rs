@@ -9,81 +9,26 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, debug, error, warn, trace};
 use tracing::Instrument;
 use tracing::{info_span}; 
+use chrono::NaiveTime;
 
-pub mod order_book;
-pub mod streaming;
+pub mod ob_manager;
 pub mod router;
 
-use crate::order_book::{OrderBook, DepthUpdate, CombinedDepthUpdate, UpdateDecision};
-//use crate::streaming::{create_ws_url, streaming};
-use crate::router::{};
+use crate::ob_manager::init_order_books;
+use crate::ob_manager::order_book::{OrderBook};
+use crate::router::{DualRouter};
 
-pub fn init_order_books(
-    currency_pairs: &'static [&'static str], 
-    mut receivers: HashMap<String, mpsc::Receiver<DepthUpdate>>,
+pub fn generate_orderbooks(
+    currency_pairs: &'static [&'static str],
+    chan_cap: usize,
+    park_cap: usize,
+    switch_cutoffs: (NaiveTime, NaiveTime),
 ) -> HashMap<String, watch::Receiver<OrderBook>> {
-    let mut ob_streams: HashMap<String, watch::Receiver<OrderBook>> = HashMap::new();
 
-    for &pair in currency_pairs {
-        let pair_up = pair.to_ascii_uppercase();
-        let mut rx = receivers
-        .remove(&pair_up)
-        .expect("router created a channel for every symbol");
+    let dual_router = DualRouter::new(switch_cutoffs, currency_pairs);
+    let receivers = dual_router.start_dual_router(chan_cap, park_cap);
 
-        let (tx_ob, rx_ob) = watch::channel(OrderBook::new(pair));
-        ob_streams.insert(pair_up.clone(), rx_ob);
+    let ob_streams = init_order_books(currency_pairs, receivers);
 
-        tokio::spawn(async move {
-            let mut ob =  match OrderBook::init_ob(pair).await {
-                Ok(ob) => {
-                    debug!("{} orderbook is initiated, last Id: {:?}", ob.symbol, ob.snapshot_id);
-                    ob
-                },
-                Err(e) => {
-                    eprintln!("[{pair}] snapshot init error: {e}");
-                    return;
-                }
-            };
-            let mut need_resync = false;
-            let _ = tx_ob.send_replace(ob);
-
-            while let Some(du) = rx.recv().await {
-
-                if need_resync {                    
-                    let fresh_ob = match OrderBook::init_ob(pair).await {
-                        Ok(ob) => ob,
-                        Err(e) => {
-                            eprintln!("[{pair}] snapshot init error: {e}");
-                            return;
-                        }
-                    };
-                    let _ = tx_ob.send_replace(fresh_ob);
-                    need_resync = false;
-                } else {
-                    let _ = tx_ob.send_modify(|book| {
-                        match book.continuity_check(&du) {
-                            UpdateDecision::Drop => {trace!("Update dropped");},
-                            UpdateDecision::Apply(du) => {
-                                trace!("Update applied");
-                                book.apply_update(du);
-                            }
-                            UpdateDecision::Resync(info) => {
-                                trace!("Resync required");
-                                eprintln!(
-                                    "[{pair}] RESYNC: expected pu={:?}, got pu={}, u={}",
-                                    info.expected_pu, info.got_pu, info.got_u
-                                );
-                                need_resync = true;
-                            }
-                        }
-                    });
-                }
-            }
-
-        }.instrument(info_span!("orderbook_task", symbol = %pair)));
-    }
     ob_streams
 }
-
-
-

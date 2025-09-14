@@ -8,8 +8,10 @@ use futures_util::pin_mut;
 use chrono::{NaiveTime, Timelike, Utc, Duration as ChronoDur};
 use tracing::{info, debug, error, warn, trace};
 
-use crate::order_book::{DepthUpdate, CombinedDepthUpdate};
-use crate::streaming::{TimedStream};
+pub mod streaming;
+
+use crate::ob_manager::order_book::{DepthUpdate, CombinedDepthUpdate};
+use crate::router::streaming::{TimedStream};
 
 type DynDepth = Pin<Box<dyn Stream<Item = CombinedDepthUpdate> + Send>>;
 
@@ -29,7 +31,6 @@ pub struct DualRouter {
     stream_a: TimedStream,
     stream_b: TimedStream,
 }
-
 
 impl DualRouter {
 
@@ -135,7 +136,6 @@ impl DualRouter {
                 let a_open = stream_a.is_some();
                 let b_open = stream_b.is_some();
 
-
                 tokio::select! {
                     // 6a) time-based mode change
                     changed = ctrl_rx.changed() => {
@@ -222,6 +222,17 @@ impl DualRouter {
     }
 }
 
+#[inline]
+fn channel_load(
+    tx: &mpsc::Sender<DepthUpdate>, 
+    chan_cap: usize, 
+    du: &mut DepthUpdate,
+) {
+    let remaining = tx.capacity();
+    let que_len = chan_cap - remaining;
+    du.channel_load = Some(que_len);
+}
+ 
 async fn apply_transition(
     old: Mode, 
     new: Mode,
@@ -300,7 +311,7 @@ async fn flush_park(
 
 async fn rout_mode(
     switch_cutoff: (NaiveTime, NaiveTime),
-    mut ctrl_tx: tokio::sync::watch::Sender<Mode>,
+    ctrl_tx: tokio::sync::watch::Sender<Mode>,
 ) {
     let (cut_a, cut_b) = switch_cutoff;
     let win_a_start= sub_secs_wrap(cut_a, 3);
@@ -357,120 +368,3 @@ fn sub_secs_wrap(t: NaiveTime, secs: i64) -> NaiveTime {
     if s < 0 { s += DAY; }
     NaiveTime::from_num_seconds_from_midnight_opt(s as u32, 0).unwrap()
 }
-
-////////////////////////////////////////////////////////////////////////////////////////
-//pub fn start_dual_router<S1, S2>(
-//        mut primary: S1,
-//        mut secondary: S2,
-//        symbols: &[&str],
-//        chan_cap: usize,
-//        park_cap: usize,
-//    ) -> (RouterHandle, HashMap<String, mpsc::Receiver<DepthUpdate>>)
-//    where
-//        S1: Stream<Item = CombinedDepthUpdate> + Send + 'static + Unpin,
-//        S2: Stream<Item = CombinedDepthUpdate> + Send + 'static + Unpin,
-//    {
-//        let mut out_map = HashMap::<String, mpsc::Sender<DepthUpdate>>::new();
-//        let mut rx_map  = HashMap::<String, mpsc::Receiver<DepthUpdate>>::new();
-//
-//        for &sym in symbols {
-//            let (tx, rx) = mpsc::channel::<DepthUpdate>(chan_cap);
-//            out_map.insert(sym.to_string(), tx);
-//            rx_map.insert(sym.to_string(), rx);
-//        }
-//
-//        let mut park: HashMap<String, VecDeque<DepthUpdate>> = symbols
-//            .iter()
-//            .map(|s| (s.to_string(), VecDeque::with_capacity(park_cap)))
-//            .collect();
-//
-//        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RouterCmd>();
-//        let handle = RouterHandle { tx: ctrl_tx };
-//
-//        tokio::spawn(async move {
-//            let mut mode = Mode::SecondaryWarm;
-//
-//            loop {
-//                tokio::select! {
-//                    cmd = ctrl_rx.recv() => {
-//                        match cmd {
-//                            Some(RouterCmd::BeginCutover { drain_for }) => {
-//                                let until = Instant::now() + drain_for;
-//                                mode = Mode::DrainingPrimary { until };
-//                            }
-//                            None => { /* no controller; keep current mode */ }
-//                        }
-//                    }
-//
-//                    p = primary.next(), if !matches!(mode, Mode::SecondaryOnly) => {
-//                        match p {
-//                            Some(env) => {
-//                                // forward immediately
-//                                let sym = env.data.s.to_ascii_uppercase();
-//                                if let Some(tx) = out_map.get(&sym) {
-//                                    let _ = tx.send(env.data).await;
-//                                }
-//                            
-//                                // if draining, check deadline and flip
-//                                if let Mode::DrainingPrimary { until } = mode {
-//                                    if Instant::now() >= until {
-//                                        // flush parked secondary
-//                                        for (sym, buf) in park.iter_mut() {
-//                                            if let Some(tx) = out_map.get(sym) {
-//                                                while let Some(du) = buf.pop_front() {
-//                                                    let _ = tx.send(du).await;
-//                                                }
-//                                            } else {
-//                                                buf.clear();
-//                                            }
-//                                        }
-//                                        mode = Mode::SecondaryOnly;
-//                                    }
-//                                }
-//                            }
-//                            None => {
-//                                // primary ended → flush parked secondary and flip immediately
-//                                for (sym, buf) in park.iter_mut() {
-//                                    if let Some(tx) = out_map.get(sym) {
-//                                        while let Some(du) = buf.pop_front() {
-//                                            let _ = tx.send(du).await;
-//                                        }
-//                                    } else {
-//                                        buf.clear();
-//                                    }
-//                                }
-//                                mode = Mode::SecondaryOnly;
-//                            }
-//                        }
-//                    }
-//                    s = secondary.next() => {
-//                        match s {
-//                            Some(env) => {
-//                                let sym = env.data.s.to_ascii_uppercase();
-//                                match mode {
-//                                    Mode::SecondaryWarm | Mode::DrainingPrimary { .. } => {
-//                                        // park bounded; on overflow drop oldest
-//                                        if let Some(buf) = park.get_mut(&sym) {
-//                                            if buf.len() >= park_cap { buf.pop_front(); }
-//                                            buf.push_back(env.data);
-//                                        }
-//                                    }
-//                                    Mode::SecondaryOnly => {
-//                                        // after flip: forward directly
-//                                        if let Some(tx) = out_map.get(&sym) {
-//                                            let _ = tx.send(env.data).await;
-//                                        }
-//                                    }
-//                                }
-//                            }
-//                            None => {
-//                                // secondary ended unexpectedly; minimal handling is to ignore here.
-//                                // reconnection policy can live outside.
-//                            }
-//                        }
-//                    }
-//                }
-//            }
-//        });
-//        (handle, rx_map)
-//    }

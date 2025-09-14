@@ -18,6 +18,7 @@ pub struct DepthUpdate {
     pub pu: u64,      // Final update Id in last stream(ie `u` in last stream)
     pub b: Vec<[String; 2]>,   // bids updates [price, qty]
     pub a: Vec<[String; 2]>,   // asks updates
+    pub channel_load: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -51,7 +52,6 @@ pub enum UpdateDecision<'a>{
     Apply(&'a DepthUpdate),         // apply to book
     Resync(ResyncNeeded),       // trigger re-snapshot
 }
-
 
 #[derive(Debug, Clone)]
 pub struct OrderBook {
@@ -137,8 +137,7 @@ impl OrderBook {
         }
     }
 
-    /// Apply one WS depth update (absolute quantities).
-    /// Assumes you've enforced U/u/pu sequencing outside.
+    /// Apply one WS depth update (absolute quantities)
     pub fn apply_update(&mut self, ev: &DepthUpdate) {
         // bids
         for [p, q] in &ev.b {
@@ -177,7 +176,7 @@ impl OrderBook {
                 });
                 
             }
-            Some(s) => s,            
+            Some(s) => s + 1,            
         };
 
         match self.last_u {
@@ -223,7 +222,7 @@ impl OrderBook {
     }
 
     fn parse_f64(s: &str) -> f64 {
-        // Binance sends clean numeric strings; unwrap is fine for now.
+        // Binance sends clean numeric strings
         s.parse::<f64>().unwrap()
     }
 
