@@ -1,3 +1,63 @@
+//! # binance-stream-handler
+//!
+//! Produce live Binance order books as Tokio `watch::Receiver<OrderBook>` streams.
+//!
+//! ## Quick start
+//!
+//! ```no_run
+//! use binance_stream_handler::generate_orderbooks;
+//! use chrono::NaiveTime;
+//!
+//! // Currency pairs must be defined as a 'static slice.
+//! pub static CURRENCY_PAIRS: &[&str] = &["ADAUSDT", "DOGEUSDT"];
+//!
+//! #[tokio::main(flavor = "multi_thread")]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let cutoffs = (NaiveTime::from_hms_opt(2,0,0).unwrap(),
+//!                    NaiveTime::from_hms_opt(18,42,0).unwrap());
+//!
+//!     let streams = generate_orderbooks(CURRENCY_PAIRS, 1024, 512, cutoffs);
+//!
+//!     let mut ada = streams["ADAUSDT"].clone();
+//!     tokio::spawn(async move {
+//!         while ada.changed().await.is_ok() {
+//!             let ob = ada.borrow().clone();
+//!             println!("{} best bid={:?} ask={:?}",
+//!                      ob.symbol, ob.bids.keys().last(), ob.asks.keys().next());
+//!         }
+//!     });
+//!
+//!     futures_util::future::pending::<()>().await;
+//!     Ok(())
+//! }
+//! ```
+
+//! ## The `OrderBook` type
+//!
+//! Each stream yields an [`OrderBook`], which contains the current snapshot
+//! of bids and asks for a symbol.
+//!
+//! ```text
+//! struct OrderBook {
+//!     symbol: String,                     // e.g. "ADAUSDT"
+//!     bids: BTreeMap<Price, Qty>,         // sorted descending
+//!     asks: BTreeMap<Price, Qty>,         // sorted ascending
+//!     last_u: Option<u64>,                // last update ID applied
+//!     snapshot_id: Option<u64>,           // REST snapshot ID
+//!     depth: u16                          // snapshot depth (default 1000)
+//! }
+//! ```
+//!
+//! - **`bids`**: map from price → quantity, sorted by price descending  
+//! - **`asks`**: map from price → quantity, sorted by price ascending  
+//! - **`last_u`**: last WebSocket update sequence number applied  
+//! - **`snapshot_id`**: ID of the REST snapshot used to initialize the book  
+//! - **`depth`**: the configured maximum depth (default: 1000)  
+//!
+//! You normally just clone the latest `OrderBook` from a `watch::Receiver` and
+//! inspect the maps to get the best bid/ask or traverse the book.
+
+
 use futures_util::{StreamExt, SinkExt, Stream, pin_mut};
 use serde::Deserialize;
 use tokio_tungstenite::{connect_async};
@@ -11,10 +71,10 @@ use tracing::Instrument;
 use tracing::{info_span}; 
 use chrono::NaiveTime;
 
-pub mod ob_manager;
-pub mod router;
+mod ob_manager;
+mod router;
 
-use crate::ob_manager::init_order_books;
+pub use crate::ob_manager::init_order_books;
 use crate::ob_manager::order_book::{OrderBook};
 use crate::router::{DualRouter};
 

@@ -53,6 +53,13 @@ pub enum UpdateDecision<'a>{
     Resync(ResyncNeeded),       // trigger re-snapshot
 }
 
+/// A sorted Binance order book (bids descending by price, asks ascending).
+///
+/// Values are **absolute quantities** (Binance-style). `last_u` and `snapshot_id`
+/// reflect the latest applied update and the initializing REST snapshot respectively.
+///
+/// Most users don't construct `OrderBook` directly—consume it via the
+/// `watch::Receiver<OrderBook>` returned by [`generate_orderbooks`].
 #[derive(Debug, Clone)]
 pub struct OrderBook {
     pub symbol: String,

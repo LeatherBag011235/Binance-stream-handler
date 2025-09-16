@@ -8,7 +8,7 @@ use futures_util::pin_mut;
 use chrono::{NaiveTime, Timelike, Utc, Duration as ChronoDur};
 use tracing::{info, debug, error, warn, trace};
 
-pub mod streaming;
+mod streaming;
 
 use crate::ob_manager::order_book::{DepthUpdate, CombinedDepthUpdate};
 use crate::router::streaming::{TimedStream};
