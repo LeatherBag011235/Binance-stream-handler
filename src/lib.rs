@@ -57,26 +57,25 @@
 //! You normally just clone the latest `OrderBook` from a `watch::Receiver` and
 //! inspect the maps to get the best bid/ask or traverse the book.
 
-
-use futures_util::{StreamExt, SinkExt, Stream, pin_mut};
-use serde::Deserialize;
-use tokio_tungstenite::{connect_async};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_stream::wrappers::ReceiverStream;
+use chrono::NaiveTime;
 use futures_util::future::ready;
+use futures_util::{pin_mut, SinkExt, Stream, StreamExt};
+use serde::Deserialize;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, watch};
-use tracing::{info, debug, error, warn, trace};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::info_span;
 use tracing::Instrument;
-use tracing::{info_span}; 
-use chrono::NaiveTime;
+use tracing::{debug, error, info, trace, warn};
 
 mod ob_manager;
 mod router;
 
 pub use crate::ob_manager::init_order_books;
-use crate::ob_manager::order_book::{OrderBook};
-use crate::router::{DualRouter};
+pub use crate::ob_manager::order_book::OrderBook;
+use crate::router::DualRouter;
 
 pub fn generate_orderbooks(
     currency_pairs: &'static [&'static str],
@@ -84,7 +83,6 @@ pub fn generate_orderbooks(
     park_cap: usize,
     switch_cutoffs: (NaiveTime, NaiveTime),
 ) -> HashMap<String, watch::Receiver<OrderBook>> {
-
     let dual_router = DualRouter::new(switch_cutoffs, currency_pairs);
     let receivers = dual_router.start_dual_router(chan_cap, park_cap);
 

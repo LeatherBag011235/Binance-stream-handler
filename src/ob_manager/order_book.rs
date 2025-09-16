@@ -1,23 +1,24 @@
-use reqwest::Client;
-use std::collections::BTreeMap;
 use ordered_float::OrderedFloat as OF;
+use reqwest::Client;
 use serde::Deserialize;
-use tracing::{info, debug, error, warn, trace};
+use std::collections::BTreeMap;
+use tracing::{debug, error, info, trace, warn};
 
 type Price = OF<f64>;
-type Qty   = f64;
+type Qty = f64;
 
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct DepthUpdate {
-    pub e: String,    // Event type: "depthUpdate"
-    pub E: u64,       // Event time 
-    pub T: u64,       // Transaction time 
-    pub s: String,    // Symbol
-    pub U: u64,       // First update ID in event
-    pub u: u64,       // Final update ID in event
-    pub pu: u64,      // Final update Id in last stream(ie `u` in last stream)
-    pub b: Vec<[String; 2]>,   // bids updates [price, qty]
-    pub a: Vec<[String; 2]>,   // asks updates
+    pub e: String,           // Event type: "depthUpdate"
+    pub E: u64,              // Event time
+    pub T: u64,              // Transaction time
+    pub s: String,           // Symbol
+    pub U: u64,              // First update ID in event
+    pub u: u64,              // Final update ID in event
+    pub pu: u64,             // Final update Id in last stream(ie `u` in last stream)
+    pub b: Vec<[String; 2]>, // bids updates [price, qty]
+    pub a: Vec<[String; 2]>, // asks updates
     pub channel_load: Option<usize>,
 }
 
@@ -36,21 +37,22 @@ pub struct ResyncNeeded {
     pub got_u: u64,               // the u we received
 }
 
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 pub struct DepthSnapshot {
     #[serde(rename = "lastUpdateId")]
     last_update_id: u64,
-    E: u64, // event time (ms)
-    T: u64, // transaction time (ms)
+    E: u64,                 // event time (ms)
+    T: u64,                 // transaction time (ms)
     bids: Vec<[String; 2]>, // [price, qty]
     asks: Vec<[String; 2]>,
 }
 
 #[derive(Debug)]
-pub enum UpdateDecision<'a>{
-    Drop,                       // ignore this event
-    Apply(&'a DepthUpdate),         // apply to book
-    Resync(ResyncNeeded),       // trigger re-snapshot
+pub enum UpdateDecision<'a> {
+    Drop,                   // ignore this event
+    Apply(&'a DepthUpdate), // apply to book
+    Resync(ResyncNeeded),   // trigger re-snapshot
 }
 
 /// A sorted Binance order book (bids descending by price, asks ascending).
@@ -68,7 +70,7 @@ pub struct OrderBook {
     pub asks: BTreeMap<Price, Qty>,
     pub last_u: Option<u64>,
     pub snapshot_id: Option<u64>,
-    pub depth: u16
+    pub depth: u16,
 }
 
 impl OrderBook {
@@ -83,18 +85,14 @@ impl OrderBook {
         }
     }
 
-    pub async fn init_ob(
-        symbol: &str
-    ) -> Result<OrderBook, Box<dyn std::error::Error>> {
+    pub async fn init_ob(symbol: &str) -> Result<OrderBook, Box<dyn std::error::Error>> {
         let mut ob = OrderBook::new(symbol);
         let snapshot = ob.get_depth_snapshot(ob.depth).await?;
         ob.from_snapshot(&snapshot);
         Ok(ob)
     }
 
-    pub async fn resync_ob(
-        &mut self
-    ) -> Result<(), Box<dyn std::error::Error>>{
+    pub async fn resync_ob(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let new_snapshot = self.get_depth_snapshot(self.depth).await?;
         self.from_snapshot(&new_snapshot);
         Ok(())
@@ -105,9 +103,7 @@ impl OrderBook {
         limit: u16,
     ) -> Result<DepthSnapshot, Box<dyn std::error::Error>> {
         let sym = self.symbol.to_ascii_uppercase();
-        let url = format!(
-            "https://fapi.binance.com/fapi/v1/depth?symbol={sym}&limit={limit}"
-        );
+        let url = format!("https://fapi.binance.com/fapi/v1/depth?symbol={sym}&limit={limit}");
 
         let client = Client::builder()
             .user_agent("binance-stream-handler/0.1")
@@ -119,7 +115,7 @@ impl OrderBook {
         }
 
         let snapshot: DepthSnapshot = resp.json().await?;
-        
+
         Ok(snapshot)
     }
 
@@ -167,23 +163,18 @@ impl OrderBook {
         self.last_u = Some(ev.u);
     }
 
-    pub fn continuity_check<'a>(
-        &mut self, 
-        du: &'a DepthUpdate
-    ) -> UpdateDecision<'a> {
-
+    pub fn continuity_check<'a>(&mut self, du: &'a DepthUpdate) -> UpdateDecision<'a> {
         let snapshot_id = match self.snapshot_id {
             None => {
                 self.last_u = None;
                 return UpdateDecision::Resync(ResyncNeeded {
-                    symbol: self.symbol.clone(), 
-                    expected_pu: None, 
-                    got_pu: du.pu, 
+                    symbol: self.symbol.clone(),
+                    expected_pu: None,
+                    got_pu: du.pu,
                     got_u: du.u,
                 });
-                
             }
-            Some(s) => s + 1,            
+            Some(s) => s + 1,
         };
 
         match self.last_u {
@@ -191,10 +182,9 @@ impl OrderBook {
                 if du.U <= snapshot_id && snapshot_id <= du.u {
                     self.last_u = Some(du.u);
                     return UpdateDecision::Apply(&du);
-
-                } else if snapshot_id <= du.U  {
+                } else if snapshot_id <= du.U {
                     debug!(
-                        "Missed updates after initialization for {}, snap_id: {:?} U: {} u: {}", 
+                        "Missed updates after initialization for {}, snap_id: {:?} U: {} u: {}",
                         du.s, snapshot_id, du.U, du.u,
                     );
                     self.last_u = None;
@@ -203,7 +193,7 @@ impl OrderBook {
                         expected_pu: None,
                         got_pu: du.pu,
                         got_u: du.u,
-                    })
+                    });
                 } else {
                     return UpdateDecision::Drop;
                 }
@@ -222,7 +212,7 @@ impl OrderBook {
                         expected_pu: Some(pu),
                         got_pu: du.pu,
                         got_u: du.u,
-                    })
+                    });
                 }
             }
         }
@@ -232,5 +222,4 @@ impl OrderBook {
         // Binance sends clean numeric strings
         s.parse::<f64>().unwrap()
     }
-
 }

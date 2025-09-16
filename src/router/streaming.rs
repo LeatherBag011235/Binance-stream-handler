@@ -1,24 +1,29 @@
-use tokio_tungstenite::tungstenite::Message;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use chrono::NaiveTime;
+use futures_util::SinkExt;
 use futures_util::Stream;
 use futures_util::StreamExt;
-use futures_util::SinkExt;
-use tracing::{info, debug, error, warn, trace};
-use chrono::NaiveTime;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{debug, error, info, trace, warn};
 
-use crate::ob_manager::order_book::{CombinedDepthUpdate};
+use crate::ob_manager::order_book::CombinedDepthUpdate;
 
-pub struct TimedStream  {
+pub struct TimedStream {
     pub currency_pairs: &'static [&'static str],
     pub life_span: (NaiveTime, NaiveTime),
 }
 
-impl TimedStream { 
+impl TimedStream {
     pub async fn init_stream(
-        &self
-    ) -> Result<impl Stream<Item = CombinedDepthUpdate> + Send + 'static, Box<dyn std::error::Error>> {
-        let lower: Vec<String> = self.currency_pairs.iter().map(|s| s.to_lowercase()).collect();
+        &self,
+    ) -> Result<impl Stream<Item = CombinedDepthUpdate> + Send + 'static, Box<dyn std::error::Error>>
+    {
+        let lower: Vec<String> = self
+            .currency_pairs
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
         let currency_lower: Vec<&str> = lower.iter().map(|s| s.as_str()).collect();
 
         let ws_url = Self::create_ws_url(&currency_lower);
@@ -28,8 +33,8 @@ impl TimedStream {
 
     pub async fn streaming(
         url: String,
-    ) -> Result<impl Stream<Item = CombinedDepthUpdate> + Send + 'static, Box<dyn std::error::Error>> {
-
+    ) -> Result<impl Stream<Item = CombinedDepthUpdate> + Send + 'static, Box<dyn std::error::Error>>
+    {
         info!("Connecting to {url} ...");
         let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
         info!("Connected. Waiting for messages...");
@@ -48,7 +53,7 @@ impl TimedStream {
                         let _ = ws.send(Message::Pong(payload)).await;
                     }
                     Ok(Message::Close(_)) => break,
-                    _ => (), 
+                    _ => (),
                 }
             }
         });
@@ -56,7 +61,7 @@ impl TimedStream {
         Ok(ReceiverStream::new(rx))
     }
 
-    pub fn create_ws_url(currency_pairs: &Vec<&str>,) -> String {
+    pub fn create_ws_url(currency_pairs: &Vec<&str>) -> String {
         let stream_spec = "@depth@100ms";
         let base_url = "wss://fstream.binance.com/stream?streams=";
 

@@ -1,17 +1,17 @@
-use std::collections::{HashMap, VecDeque};
-use std::time::{Duration as StdDur, Instant};
-use std::pin::Pin;
+use chrono::{Duration as ChronoDur, NaiveTime, Timelike, Utc};
+use futures_util::pin_mut;
 use futures_util::{Stream, StreamExt};
+use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::time::{Duration as StdDur, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::sleep;
-use futures_util::pin_mut;
-use chrono::{NaiveTime, Timelike, Utc, Duration as ChronoDur};
-use tracing::{info, debug, error, warn, trace};
+use tracing::{debug, error, info, trace, warn};
 
 mod streaming;
 
-use crate::ob_manager::order_book::{DepthUpdate, CombinedDepthUpdate};
-use crate::router::streaming::{TimedStream};
+use crate::ob_manager::order_book::{CombinedDepthUpdate, DepthUpdate};
+use crate::router::streaming::TimedStream;
 
 type DynDepth = Pin<Box<dyn Stream<Item = CombinedDepthUpdate> + Send>>;
 
@@ -23,7 +23,10 @@ enum Mode {
 }
 
 #[derive(PartialEq)]
-enum Active { A, B}
+enum Active {
+    A,
+    B,
+}
 
 pub struct DualRouter {
     pub switch_cutoff: (NaiveTime, NaiveTime),
@@ -33,7 +36,6 @@ pub struct DualRouter {
 }
 
 impl DualRouter {
-
     pub fn new(
         switch_cutoff: (NaiveTime, NaiveTime),
         currency_pairs: &'static [&'static str],
@@ -41,13 +43,13 @@ impl DualRouter {
         let life_span_a = switch_cutoff;
         let life_span_b = (switch_cutoff.1, switch_cutoff.0);
 
-        let stream_a = TimedStream { 
-            currency_pairs: currency_pairs, 
-            life_span: (life_span_a) 
+        let stream_a = TimedStream {
+            currency_pairs: currency_pairs,
+            life_span: (life_span_a),
         };
-        let stream_b = TimedStream { 
-            currency_pairs: currency_pairs, 
-            life_span: (life_span_b) 
+        let stream_b = TimedStream {
+            currency_pairs: currency_pairs,
+            life_span: (life_span_b),
         };
 
         Self {
@@ -59,12 +61,12 @@ impl DualRouter {
     }
 
     pub fn start_dual_router(
-        &self,         
+        &self,
         chan_cap: usize,
         park_cap: usize,
-    ) -> HashMap::<String, mpsc::Receiver<DepthUpdate>> {
+    ) -> HashMap<String, mpsc::Receiver<DepthUpdate>> {
         let mut out_map = HashMap::<String, mpsc::Sender<DepthUpdate>>::new();
-        let mut rx_map  = HashMap::<String, mpsc::Receiver<DepthUpdate>>::new();
+        let mut rx_map = HashMap::<String, mpsc::Receiver<DepthUpdate>>::new();
 
         for &sym in self.currency_pairs {
             let (tx, rx) = mpsc::channel::<DepthUpdate>(chan_cap);
@@ -72,7 +74,8 @@ impl DualRouter {
             rx_map.insert(sym.to_string(), rx);
         }
 
-        let mut park: HashMap<String, VecDeque<DepthUpdate>> = self.currency_pairs
+        let mut park: HashMap<String, VecDeque<DepthUpdate>> = self
+            .currency_pairs
             .iter()
             .map(|s| (s.to_string(), VecDeque::with_capacity(park_cap)))
             .collect();
@@ -87,7 +90,6 @@ impl DualRouter {
         let life_span_b = self.stream_b.life_span;
 
         tokio::spawn(async move {
-            
             let mut active: Option<Active> = None;
 
             // Lazily-opened runtime streams
@@ -96,9 +98,8 @@ impl DualRouter {
 
             // capture the configured per-symbol bound
             let park_cap_local = park.values().next().map(|v| v.capacity()).unwrap_or(0);
-            
 
-            let mut pending_mode: Option<Mode> = None; 
+            let mut pending_mode: Option<Mode> = None;
             let mut mode = *ctrl_rx.borrow();
 
             match mode {
@@ -125,12 +126,18 @@ impl DualRouter {
             loop {
                 if let Some(new_mode) = pending_mode.take() {
                     mode = apply_transition(
-                        mode, new_mode,
+                        mode,
+                        new_mode,
                         &mut active,
-                        &mut stream_a, &mut stream_b,
-                        currency_pairs, life_span_a, life_span_b,
-                        &mut out_map, &mut park,
-                    ).await;
+                        &mut stream_a,
+                        &mut stream_b,
+                        currency_pairs,
+                        life_span_a,
+                        life_span_b,
+                        &mut out_map,
+                        &mut park,
+                    )
+                    .await;
                 }
 
                 let a_open = stream_a.is_some();
@@ -160,7 +167,7 @@ impl DualRouter {
                                     Mode::BothAB => {
                                         if active == Some(Active::A) {
                                             if let Some(tx) = out_map.get(&sym) {
-                                                let _ = tx.send(du).await; 
+                                                let _ = tx.send(du).await;
                                             }
                                         } else {
                                             if let Some(buf) = park.get_mut(&sym) {
@@ -170,7 +177,7 @@ impl DualRouter {
                                         }
                                     }
                                     Mode::OnlyB => {
-                                        // A is closed 
+                                        // A is closed
                                     }
                                 }
                             }
@@ -184,7 +191,7 @@ impl DualRouter {
                     }, if b_open => {
                         match maybe_env {
                             Some(env) => {
-                                let CombinedDepthUpdate { data: du, .. } = env; 
+                                let CombinedDepthUpdate { data: du, .. } = env;
                                 let sym = du.s.to_ascii_uppercase();
 
                                 match mode {
@@ -197,7 +204,7 @@ impl DualRouter {
                                         if active == Some(Active::B) {
                                             if let Some(tx) = out_map.get(&sym) {
                                                 let _ = tx.send(du).await;
-                                            }    
+                                            }
                                         } else {
                                             if let Some(buf) = park.get_mut(&sym) {
                                                 if buf.len() >= park_cap_local { buf.pop_front(); }
@@ -223,34 +230,29 @@ impl DualRouter {
 }
 
 #[inline]
-fn channel_load(
-    tx: &mpsc::Sender<DepthUpdate>, 
-    chan_cap: usize, 
-    du: &mut DepthUpdate,
-) {
+fn channel_load(tx: &mpsc::Sender<DepthUpdate>, chan_cap: usize, du: &mut DepthUpdate) {
     let remaining = tx.capacity();
     let que_len = chan_cap - remaining;
     du.channel_load = Some(que_len);
 }
- 
+
 async fn apply_transition(
-    old: Mode, 
+    old: Mode,
     new: Mode,
     active: &mut Option<Active>,
     stream_a: &mut Option<DynDepth>,
     stream_b: &mut Option<DynDepth>,
-    currency_pairs: &'static [&'static str], 
+    currency_pairs: &'static [&'static str],
     life_span_a: (NaiveTime, NaiveTime),
     life_span_b: (NaiveTime, NaiveTime),
-    out_map: &mut HashMap::<String, mpsc::Sender<DepthUpdate>>,
+    out_map: &mut HashMap<String, mpsc::Sender<DepthUpdate>>,
     park: &mut HashMap<String, VecDeque<DepthUpdate>>,
 ) -> Mode {
-
     match (old, new) {
         (o, n) if o == n => {
             trace!("Pseudo mode flip occured");
-            return n 
-        },
+            return n;
+        }
         // OnlyA → BothAB: keep A primary, open B (start parking B)
         (Mode::OnlyA, Mode::BothAB) => {
             open_stream(stream_b, currency_pairs, life_span_b).await;
@@ -275,9 +277,11 @@ async fn apply_transition(
             open_stream(stream_a, currency_pairs, life_span_a).await;
             *active = Some(Active::A);
         }
-        _ => { panic!("Unexpected channel/mode switch from {:?} to {:?}", old, new); }
+        _ => {
+            panic!("Unexpected channel/mode switch from {:?} to {:?}", old, new);
+        }
     }
-    
+
     new
 }
 
@@ -287,7 +291,10 @@ async fn open_stream(
     life_span: (NaiveTime, NaiveTime),
 ) {
     if stream.is_none() {
-        let mut builder = TimedStream { currency_pairs, life_span };
+        let mut builder = TimedStream {
+            currency_pairs,
+            life_span,
+        };
         if let Ok(s) = builder.init_stream().await {
             *stream = Some(Box::pin(s));
         }
@@ -296,7 +303,7 @@ async fn open_stream(
 
 async fn flush_park(
     out_map: &mut HashMap<String, mpsc::Sender<DepthUpdate>>,
-    park: &mut HashMap<String, VecDeque<DepthUpdate>>
+    park: &mut HashMap<String, VecDeque<DepthUpdate>>,
 ) {
     for (sym, buf) in park.iter_mut() {
         if let Some(tx) = out_map.get(sym) {
@@ -314,28 +321,20 @@ async fn rout_mode(
     ctrl_tx: tokio::sync::watch::Sender<Mode>,
 ) {
     let (cut_a, cut_b) = switch_cutoff;
-    let win_a_start= sub_secs_wrap(cut_a, 3);
-    let win_b_start= sub_secs_wrap(cut_b, 3);
+    let win_a_start = sub_secs_wrap(cut_a, 3);
+    let win_b_start = sub_secs_wrap(cut_b, 3);
 
     let mut last_sent: Option<Mode> = Some(Mode::OnlyA);
 
     loop {
         let now_tod: NaiveTime = Utc::now().time();
 
-        let in_double_a = in_window(
-            now_tod, 
-            win_a_start, 
-            cut_a,
-        );
-        let in_double_b = in_window(
-            now_tod, 
-            win_b_start, 
-            cut_b,
-        );
+        let in_double_a = in_window(now_tod, win_a_start, cut_a);
+        let in_double_b = in_window(now_tod, win_b_start, cut_b);
 
         let new_mode = if in_double_a || in_double_b {
             Mode::BothAB
-        } else if in_window (now_tod, cut_a, cut_b) {
+        } else if in_window(now_tod, cut_a, cut_b) {
             Mode::OnlyA
         } else {
             Mode::OnlyB
@@ -365,6 +364,8 @@ fn sub_secs_wrap(t: NaiveTime, secs: i64) -> NaiveTime {
     const DAY: i64 = 24 * 60 * 60;
     let cur = t.num_seconds_from_midnight() as i64;
     let mut s = (cur - secs) % DAY;
-    if s < 0 { s += DAY; }
+    if s < 0 {
+        s += DAY;
+    }
     NaiveTime::from_num_seconds_from_midnight_opt(s as u32, 0).unwrap()
 }
