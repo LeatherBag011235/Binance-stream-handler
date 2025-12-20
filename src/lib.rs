@@ -58,17 +58,8 @@
 //! inspect the maps to get the best bid/ask or traverse the book.
 
 use chrono::NaiveTime;
-use futures_util::future::ready;
-use futures_util::{pin_mut, SinkExt, Stream, StreamExt};
-use serde::Deserialize;
 use std::collections::HashMap;
-use tokio::sync::{mpsc, watch};
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::info_span;
-use tracing::Instrument;
-use tracing::{debug, error, info, trace, warn};
+use tokio::sync::{watch};
 
 mod ob_manager;
 mod router;

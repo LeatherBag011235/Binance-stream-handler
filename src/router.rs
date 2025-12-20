@@ -1,10 +1,9 @@
-use chrono::{Duration as ChronoDur, NaiveTime, Timelike, Utc};
-use futures_util::pin_mut;
+use chrono::{NaiveTime, Timelike, Utc};
 use futures_util::{Stream, StreamExt};
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
-use std::time::{Duration as StdDur, Instant};
-use tokio::sync::{mpsc, oneshot, watch};
+use std::time::{Duration as StdDur};
+use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
@@ -227,13 +226,6 @@ impl DualRouter {
         });
         rx_map
     }
-}
-
-#[inline]
-fn channel_load(tx: &mpsc::Sender<DepthUpdate>, chan_cap: usize, du: &mut DepthUpdate) {
-    let remaining = tx.capacity();
-    let que_len = chan_cap - remaining;
-    du.channel_load = Some(que_len);
 }
 
 async fn apply_transition(

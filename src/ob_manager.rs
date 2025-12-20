@@ -1,4 +1,3 @@
-use futures_util::future::ready;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, watch};
 use tracing::info_span;
@@ -7,7 +6,7 @@ use tracing::{debug, error, info, trace, warn};
 
 pub mod order_book;
 
-use crate::ob_manager::order_book::{CombinedDepthUpdate, DepthUpdate, OrderBook, UpdateDecision};
+use crate::ob_manager::order_book::{DepthUpdate, OrderBook, UpdateDecision};
 
 pub fn init_order_books(
     currency_pairs: &'static [&'static str],
