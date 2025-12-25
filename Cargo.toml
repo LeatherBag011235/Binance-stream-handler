@@ -1,9 +1,9 @@
 [package]
 name = "binance-stream-handler"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.74"                # Set your true MSRV after CI verifies it
-description = "Ergonomic, async WebSocket/HTTP client pieces for Binance market data streams."
+description = "Async WebSocket/HTTP app for Binance Orderbooks streams."
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/LeatherBag011235/Binance-stream-handler"
