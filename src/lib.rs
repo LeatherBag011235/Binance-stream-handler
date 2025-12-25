@@ -58,6 +58,8 @@
 //! inspect the maps to get the best bid/ask or traverse the book.
 
 use chrono::NaiveTime;
+
+
 use std::collections::HashMap;
 use tokio::sync::{watch};
 
@@ -68,15 +70,16 @@ pub use crate::ob_manager::init_order_books;
 pub use crate::ob_manager::order_book::OrderBook;
 use crate::router::DualRouter;
 
-pub fn generate_orderbooks(
+pub async fn generate_orderbooks(
     currency_pairs: &'static [&'static str],
     chan_cap: usize,
     park_cap: usize,
     switch_cutoffs: (NaiveTime, NaiveTime),
 ) -> HashMap<String, watch::Receiver<OrderBook>> {
     let dual_router = DualRouter::new(switch_cutoffs, currency_pairs);
-    let receivers = dual_router.start_dual_router(chan_cap, park_cap);
+    let (receivers, connected) = dual_router.start_dual_router(chan_cap, park_cap);
 
+    connected.notified().await;
     let ob_streams = init_order_books(currency_pairs, receivers);
 
     ob_streams

@@ -4,7 +4,19 @@ use tracing_subscriber::EnvFilter;
 
 use binance_stream_handler::generate_orderbooks;
 
-pub static CURRENCY_PAIRS: &[&str] = &["ADAUSDT", "DOGEUSDT"];
+pub static CURRENCY_PAIRS: &[&str] = &[
+    "ADAUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "DOTUSDT",
+];
+
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chan_cap = 1024;
     let park_cap = 512;
 
-    let ob_streams = generate_orderbooks(CURRENCY_PAIRS, chan_cap, park_cap, switch_cutoffs);
+    let ob_streams = generate_orderbooks(CURRENCY_PAIRS, chan_cap, park_cap, switch_cutoffs).await;
 
     let mut ada_rx = ob_streams.get("ADAUSDT").unwrap().clone();
 

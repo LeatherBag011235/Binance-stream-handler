@@ -45,17 +45,28 @@ impl TimedStream {
             while let Some(msg_res) = ws.next().await {
                 match msg_res {
                     Ok(Message::Text(txt)) => {
-                        if let Ok(env) = serde_json::from_str::<CombinedDepthUpdate>(&txt) {
-                            let _ = tx.send(env).await;
+                        match serde_json::from_str::<CombinedDepthUpdate>(&txt) {
+                            Ok(env) => { if let Err(e) = tx.send(env).await {
+                                warn!(error=%e, "WS->internal channel closed; WS reader exiting");
+                            } }
+                            Err(e) => {
+                                warn!(error=%e, "Failed to parse CombinedDepthUpdate; dropping WS message");
+                            }
                         }
                     }
                     Ok(Message::Ping(payload)) => {
-                        let _ = ws.send(Message::Pong(payload)).await;
+                        if let Err(e) = ws.send(Message::Pong(payload)).await {
+                        warn!(error=%e, "Failed to send Pong; WS reader exiting");
+                        }
+                    }
+                    Ok(Message::Pong(_)) => {
+
                     }
                     Ok(Message::Close(_)) => break,
                     _ => (),
                 }
             }
+            warn!("WS reader task ended");
         });
 
         Ok(ReceiverStream::new(rx))

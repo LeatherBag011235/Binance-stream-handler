@@ -34,6 +34,7 @@ pub struct ResyncNeeded {
     pub symbol: String,
     pub expected_pu: Option<u64>, // what we expected (prev u)
     pub got_pu: u64,              // the pu we received
+    pub got_U: u64,
     pub got_u: u64,               // the u we received
 }
 
@@ -171,32 +172,37 @@ impl OrderBook {
                     symbol: self.symbol.clone(),
                     expected_pu: None,
                     got_pu: du.pu,
+                    got_U: du.U,
                     got_u: du.u,
                 });
             }
-            Some(s) => s + 1,
+            Some(s) => s,
         };
 
         match self.last_u {
             None => {
-                if du.U <= snapshot_id && snapshot_id <= du.u {
-                    self.last_u = Some(du.u);
-                    return UpdateDecision::Apply(&du);
-                } else if snapshot_id <= du.U {
-                    debug!(
-                        "Missed updates after initialization for {}, snap_id: {:?} U: {} u: {}",
-                        du.s, snapshot_id, du.U, du.u,
-                    );
-                    self.last_u = None;
-                    return UpdateDecision::Resync(ResyncNeeded {
-                        symbol: self.symbol.clone(),
-                        expected_pu: None,
-                        got_pu: du.pu,
-                        got_u: du.u,
-                    });
-                } else {
+                if du.u < snapshot_id {
                     return UpdateDecision::Drop;
                 }
+            
+                if du.U <= snapshot_id && snapshot_id <= du.u {
+                    self.last_u = Some(du.u);
+                    return UpdateDecision::Apply(du);
+                }
+            
+                // du.U > snapshot_id => we missed the bridging update
+                debug!(
+                    "Missed updates after initialization for {}, snap_id: {} U: {} u: {}",
+                    du.s, snapshot_id, du.U, du.u,
+                );
+                self.last_u = None;
+                return UpdateDecision::Resync(ResyncNeeded {
+                    symbol: self.symbol.clone(),
+                    expected_pu: None,
+                    got_pu: du.pu,
+                    got_U: du.U,
+                    got_u: du.u,
+                });
             }
 
             Some(pu) => {
@@ -211,6 +217,7 @@ impl OrderBook {
                         symbol: self.symbol.clone(),
                         expected_pu: Some(pu),
                         got_pu: du.pu,
+                        got_U: du.U,
                         got_u: du.u,
                     });
                 }

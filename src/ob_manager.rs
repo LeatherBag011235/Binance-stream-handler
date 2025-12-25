@@ -34,7 +34,7 @@ pub fn init_order_books(
                         ob
                     }
                     Err(e) => {
-                        eprintln!("[{pair}] snapshot init error: {e}");
+                        error!(symbole=%pair, error=%e, "Snapshot init failed; stopping orderbook task");
                         return;
                     }
                 };
@@ -46,7 +46,7 @@ pub fn init_order_books(
                         let fresh_ob = match OrderBook::init_ob(pair).await {
                             Ok(ob) => ob,
                             Err(e) => {
-                                eprintln!("[{pair}] snapshot init error: {e}");
+                                error!(symbole=%pair, error=%e, "Snapshot re-init failed during resync; stopping orderbook task");
                                 return;
                             }
                         };
@@ -55,18 +55,28 @@ pub fn init_order_books(
                     } else {
                         let _ = tx_ob.send_modify(|book| match book.continuity_check(&du) {
                             UpdateDecision::Drop => {
-                                info!("Update dropped");
+                                info!(
+                                    symbol=%pair,
+                                    U=du.U, u=du.u, pu=du.pu,
+                                    snap_id=?book.snapshot_id.map(|x| x+1),
+                                    last_u=?book.last_u,
+                                    "Update dropped"
+                                );
                             }
                             UpdateDecision::Apply(du) => {
                                 trace!("Update applied");
                                 book.apply_update(du);
                             }
                             UpdateDecision::Resync(info) => {
-                                trace!("Resync required");
-                                eprintln!(
-                                    "[{pair}] RESYNC: expected pu={:?}, got pu={}, u={}",
-                                    info.expected_pu, info.got_pu, info.got_u
+                                
+                                warn!(
+                                    expected_pu=?info.expected_pu,
+                                    got_pu=info.got_pu,
+                                    got_U=info.got_U,
+                                    got_u=info.got_u,
+                                    "Resync required"
                                 );
+
                                 need_resync = true;
                             }
                         });

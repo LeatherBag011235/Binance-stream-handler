@@ -5,6 +5,8 @@ use std::pin::Pin;
 use std::time::{Duration as StdDur};
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
 mod streaming;
@@ -21,7 +23,7 @@ enum Mode {
     OnlyB,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum Active {
     A,
     B,
@@ -63,7 +65,7 @@ impl DualRouter {
         &self,
         chan_cap: usize,
         park_cap: usize,
-    ) -> HashMap<String, mpsc::Receiver<DepthUpdate>> {
+    ) -> (HashMap<String, mpsc::Receiver<DepthUpdate>>, Arc<Notify>) {
         let mut out_map = HashMap::<String, mpsc::Sender<DepthUpdate>>::new();
         let mut rx_map = HashMap::<String, mpsc::Receiver<DepthUpdate>>::new();
 
@@ -80,6 +82,11 @@ impl DualRouter {
             .collect();
 
         let (ctrl_tx, mut ctrl_rx) = watch::channel(Mode::OnlyA);
+        
+        // Guards the obs initialisation before ws start feeding data. 
+        // Notifies the generate_orderbooks() that ws is connected and obs can be initialized.  
+        let connected_notify = Arc::new(Notify::new());
+        let connected_notify_task = connected_notify.clone();
 
         let switch_cutoff = self.switch_cutoff;
         tokio::spawn(rout_mode(switch_cutoff, ctrl_tx));
@@ -91,6 +98,8 @@ impl DualRouter {
         tokio::spawn(async move {
             let mut active: Option<Active> = None;
 
+            let mut prev_u_by_sym: HashMap<String, u64> = HashMap::new();
+
             // Lazily-opened runtime streams
             let mut stream_a: Option<DynDepth> = None;
             let mut stream_b: Option<DynDepth> = None;
@@ -101,15 +110,25 @@ impl DualRouter {
             let mut pending_mode: Option<Mode> = None;
             let mut mode = *ctrl_rx.borrow();
 
+            let mut connected_signaled = false;
+
             match mode {
                 Mode::OnlyA => {
                     open_stream(&mut stream_a, currency_pairs, life_span_a).await;
+                    if !connected_signaled && stream_a.is_some() {
+                        connected_notify_task.notify_waiters();
+                        connected_signaled = true;
+                    }
                     stream_b = None;
                     active = Some(Active::A);
                     flush_park(&mut out_map, &mut park).await;
                 }
                 Mode::OnlyB => {
                     open_stream(&mut stream_b, currency_pairs, life_span_b).await;
+                    if !connected_signaled && stream_b.is_some() {
+                        connected_notify_task.notify_waiters();
+                        connected_signaled = true;
+                    }
                     stream_a = None;
                     active = Some(Active::B);
                     flush_park(&mut out_map, &mut park).await;
@@ -117,6 +136,10 @@ impl DualRouter {
                 Mode::BothAB => {
                     open_stream(&mut stream_a, currency_pairs, life_span_a).await;
                     open_stream(&mut stream_b, currency_pairs, life_span_b).await;
+                    if !connected_signaled && (stream_a.is_some() || stream_b.is_some()) {
+                        connected_notify_task.notify_waiters();
+                        connected_signaled = true;
+                    }
                     active = Some(Active::A);
                 }
             }
@@ -156,17 +179,40 @@ impl DualRouter {
                             Some(env) => {
                                 let CombinedDepthUpdate {data: du, ..} = env;
                                 let sym = du.s.to_ascii_uppercase();
+                                
+                                // Internal continuity helth check
+                           
+                                if let Some(prev_u) = prev_u_by_sym.get(&sym).copied() {
+                                    if du.pu > prev_u {
+                                        warn!(
+                                            symbol=%sym,
+                                            prev_u,
+                                            got_pu=du.pu,
+                                            got_U=du.U,
+                                            got_u=du.u,
+                                            ?mode,
+                                            ?active,
+                                            "DISCONTINUITY: pu != prev_u"
+                                        );
+                                    }
+                                }
+
+                                prev_u_by_sym.insert(sym.clone(), du.u);
 
                                 match mode {
                                     Mode::OnlyA => {
                                         if let Some(tx) = out_map.get(&sym) {
-                                            let _ = tx.send(du).await;
+                                                if let Err(e) = tx.send(du).await {
+                                                    warn!(symbol=%sym, error=%e, "Router: per-symbol channel closed; dropping update");
+                                                }
                                         }
                                     }
                                     Mode::BothAB => {
                                         if active == Some(Active::A) {
                                             if let Some(tx) = out_map.get(&sym) {
-                                                let _ = tx.send(du).await;
+                                                    if let Err(e) = tx.send(du).await {
+                                                        warn!(symbol=%sym, error=%e, "Router: per-symbol channel closed; dropping update");
+                                                    }
                                             }
                                         } else {
                                             if let Some(buf) = park.get_mut(&sym) {
@@ -185,6 +231,8 @@ impl DualRouter {
                             }
                         }
                     }
+
+                    // Stream B events
                     maybe_env = async {
                         if let Some(s) = &mut stream_b { s.next().await } else { None }
                     }, if b_open => {
@@ -192,17 +240,39 @@ impl DualRouter {
                             Some(env) => {
                                 let CombinedDepthUpdate { data: du, .. } = env;
                                 let sym = du.s.to_ascii_uppercase();
-
+                                
+                                // Internal continuity helth check 
+                                if let Some(prev_u) = prev_u_by_sym.get(&sym).copied() {
+                                    if du.pu > prev_u {
+                                        warn!(
+                                            symbol=%sym,
+                                            prev_u,
+                                            got_pu=du.pu,
+                                            got_U=du.U,
+                                            got_u=du.u,
+                                            ?mode,
+                                            ?active,
+                                            "DISCONTINUITY: pu != prev_u"
+                                        );
+                                    }
+                                }
+                                
+                                prev_u_by_sym.insert(sym.clone(), du.u);
+                                
                                 match mode {
                                     Mode::OnlyB => {
                                         if let Some(tx) = out_map.get(&sym) {
-                                            let _ = tx.send(du).await;
+                                                if let Err(e) = tx.send(du).await {
+                                                    warn!(symbol=%sym, error=%e, "Router: per-symbol channel closed; dropping update");
+                                                }
                                         }
                                     }
                                     Mode::BothAB => {
                                         if active == Some(Active::B) {
                                             if let Some(tx) = out_map.get(&sym) {
-                                                let _ = tx.send(du).await;
+                                                if let Err(e) = tx.send(du).await {
+                                                    warn!(symbol=%sym, error=%e, "Router: per-symbol channel closed; dropping update");
+                                                }                                                
                                             }
                                         } else {
                                             if let Some(buf) = park.get_mut(&sym) {
@@ -224,7 +294,7 @@ impl DualRouter {
                 }
             }
         });
-        rx_map
+        (rx_map, connected_notify)
     }
 }
 
